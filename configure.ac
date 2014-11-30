@@ -5,7 +5,7 @@
 
 AC_PREREQ([2.63])
 
-AC_INIT([twister],[0.9.0])
+AC_INIT([twister],[0.9.27])
 AC_CONFIG_SRCDIR([src/twister.cpp])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
