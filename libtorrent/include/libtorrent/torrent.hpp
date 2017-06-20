@@ -200,7 +200,7 @@ namespace libtorrent
 		void read_piece(int piece);
 		void on_disk_read_complete(int ret, disk_io_job const& j, peer_request r, read_piece_struct* rp);
 
-		void get_pieces(std::vector<std::string> *pieces, int count, int max_id, int since_id, uint32_t filter_flags,
+		void get_pieces(std::vector<std::string> *pieces, int count, int max_id, int since_id, std::pair<uint32_t,uint32_t> flags,
 						mutex *mut, condition_variable *cond, int *reqs);
 		void on_disk_read_get_piece_complete(int ret, disk_io_job const& j,
 											 std::vector<std::string> *pieces, mutex *mut, condition_variable *cond, int *reqs);
@@ -302,6 +302,7 @@ namespace libtorrent
 		// ============ end deprecation =============
 
 		void piece_availability(std::vector<int>& avail) const;
+		void piece_max_seen(std::vector<int>& max_seen) const;
 		
 		void set_piece_priority(int index, int priority);
 		int piece_priority(int index) const;
@@ -887,7 +888,7 @@ namespace libtorrent
 			, std::string const& private_key
 			, std::string const& dh_params
 			, std::string const& passphrase);
-		bool is_ssl_torrent() const { return m_ssl_ctx; } 
+		bool is_ssl_torrent() const { return m_ssl_ctx.get(); } 
 		boost::asio::ssl::context* ssl_ctx() const { return m_ssl_ctx.get(); } 
 #endif
 
@@ -1405,6 +1406,9 @@ namespace libtorrent
 		// set to false until we've loaded resume data
 		bool m_resume_data_loaded;
 #endif
+	public:
+		// PEEK extension with hashcash
+		int m_peek_single_piece;
 	};
 }
 

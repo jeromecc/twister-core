@@ -116,7 +116,7 @@ void Shutdown()
     TRY_LOCK(cs_Shutdown, lockShutdown);
     if (!lockShutdown) return;
 
-    RenameThread("bitcoin-shutoff");
+    RenameThread("twister-shutoff");
     nTransactionsUpdated++;
     stopSessionTorrent();
     StopRPCThreads();
@@ -202,6 +202,7 @@ std::string HelpMessage()
     strUsage += "  -seednode=<ip>         " + _("Connect to a node to retrieve peer addresses, and disconnect") + "\n";
     strUsage += "  -externalip=<ip>       " + _("Specify your own public address") + "\n";
     strUsage += "  -onlynet=<net>         " + _("Only connect to nodes in network <net> (IPv4, IPv6 or Tor)") + "\n";
+    strUsage += "  -multiconnperip        " + _("Enable libtorrent multiple connections per ip (default: 0)") + "\n";
     strUsage += "  -discover              " + _("Discover own IP address (default: 1 when listening and no -externalip)") + "\n";
     strUsage += "  -checkpoints           " + _("Only accept block chain matching built-in checkpoints (default: 1)") + "\n";
     strUsage += "  -listen                " + _("Accept connections from outside (default: 1 if no -proxy or -connect)") + "\n";
@@ -236,7 +237,8 @@ std::string HelpMessage()
     strUsage += "  -rpcallowip=<ip>       " + _("Allow JSON-RPC connections from specified IP address") + "\n";
     if (!fHaveGUI)
         strUsage += "  -rpcconnect=<ip>       " + _("Send commands to node running on <ip> (default: 127.0.0.1)") + "\n";
-    strUsage += "  -rpcthreads=<n>        " + _("Set the number of threads to service RPC calls (default: 4)") + "\n";
+    strUsage += "  -rpcthreads=<n>        " + _("Set the number of threads to service RPC calls (default: 10)") + "\n";
+    strUsage += "  -public_server_mode    " + _("Limit JSON-RPC execution to public/safe commands only.") + "\n";
     strUsage += "  -blocknotify=<cmd>     " + _("Execute command when the best block changes (%s in cmd is replaced by block hash)") + "\n";
     strUsage += "  -walletnotify=<cmd>    " + _("Execute command when a wallet transaction changes (%s in cmd is replaced by TxID)") + "\n";
     strUsage += "  -alertnotify=<cmd>     " + _("Execute command when a relevant alert is received (%s in cmd is replaced by message)") + "\n";
@@ -280,7 +282,7 @@ struct CImportingNow
 
 void ThreadImport(std::vector<boost::filesystem::path> vImportFiles)
 {
-    RenameThread("bitcoin-loadblk");
+    RenameThread("twister-loadblk");
 
     // -reindex
     if (fReindex) {
@@ -575,6 +577,10 @@ bool AppInit2(boost::thread_group& threadGroup)
         if (r == CDBEnv::RECOVER_FAIL)
             return InitError(_("twisterwallet.dat corrupt, salvage failed"));
     }
+
+    // ********************************************************* Step 5 1/2: preinit twister/torrent before network
+
+    preinitSessionTorrent();
 
     // ********************************************************* Step 6: network initialization
 

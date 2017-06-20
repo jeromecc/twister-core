@@ -681,6 +681,8 @@ namespace aux {
 		, m_need_auto_manage(false)
 #if (defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS) && defined BOOST_HAS_PTHREADS
 		, m_network_thread(0)
+		, m_hashcash_nbits(HASHCASH_MIN_NBITS)
+		, m_hashcash_reqs(0)
 #endif
 	{
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
@@ -3563,6 +3565,17 @@ retry:
 			}
 		}
 
+		// --------------------------------------------------------------
+		// adjust hashcash: too much reqs last second => increase difficulty
+		// --------------------------------------------------------------
+		if (m_hashcash_reqs > 50) {
+			m_hashcash_nbits = std::min(m_hashcash_nbits+1, HASHCASH_MAX_NBITS);
+		}
+		if (!m_hashcash_reqs && (random() % 100) == 0 ) {
+			m_hashcash_nbits = std::max(m_hashcash_nbits-1, HASHCASH_MIN_NBITS);
+		}
+		m_hashcash_reqs = 0;
+
 		while (m_tick_residual >= 1000) m_tick_residual -= 1000;
 //		m_peer_pool.release_memory();
 	}
@@ -5718,6 +5731,9 @@ retry:
 
 		s.peerlist_size = peerlist_size;
 
+		boost::system::error_code ec;
+		s.external_addr_v4 = external_address().external_address(address_v4()).to_string(ec);
+
 		return s;
 	}
 
@@ -5814,11 +5830,12 @@ retry:
 	    }
 	}
 
-	void session_impl::dht_getData(std::string const &username, std::string const &resource, bool multi)
+	void session_impl::dht_getData(std::string const &username, std::string const &resource, bool multi, bool local)
 	{
 	    if (m_dht) m_dht->getData(username, resource, multi,
 				      boost::bind( post_dht_getData, this, _1),
-				      boost::bind( getDataDone_fun, this, username, resource, multi, _1, _2));
+				      boost::bind( getDataDone_fun, this, username, resource, multi, _1, _2),
+				      local);
     }
 
 	entry session_impl::dht_getLocalData() const

@@ -49,6 +49,8 @@ enum RPCErrorCode
     RPC_DATABASE_ERROR              = -20, // Database error
     RPC_DESERIALIZATION_ERROR       = -22, // Error parsing or validating structure in raw format
     RPC_FORBIDDEN_ON_PUBLIC_SERVER  = -23, // public server mode is activated, this method is not allowed
+    RPC_TIMEOUT                     = -24, // timeout on resource retrieval
+    RPC_RESOURCE_BUSY_TRY_AGAIN     = -25, // Resource is currently busy, try again later
 
     // P2P client errors
     RPC_CLIENT_NOT_CONNECTED        = -9,  // Bitcoin is not connected
@@ -150,6 +152,7 @@ extern json_spirit::Value getaddednodeinfo(const json_spirit::Array& params, boo
 
 extern json_spirit::Value dumpprivkey(const json_spirit::Array& params, bool fHelp); // in rpcdump.cpp
 extern json_spirit::Value dumppubkey(const json_spirit::Array& params, bool fHelp); // in rpcdump.cpp
+extern json_spirit::Value testvector(const json_spirit::Array& params, bool fHelp); // in rpcdump.cpp
 extern json_spirit::Value importprivkey(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value dumpwallet(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value importwallet(const json_spirit::Array& params, bool fHelp);
@@ -198,15 +201,22 @@ extern json_spirit::Value gettxout(const json_spirit::Array& params, bool fHelp)
 extern json_spirit::Value verifychain(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getlastsoftcheckpoint(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value dhtput(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value dhtputraw(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value dhtget(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value newpostmsg(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newpostcustom(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newpostraw(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value newdirectmsg(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value newrtmsg(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newfavmsg(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getposts(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getdirectmsgs(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getmentions(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getfavs(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value setspammsg(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getspammsg(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value setpreferredspamlang(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getpreferredspamlang(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value follow(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value unfollow(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getfollowing(const json_spirit::Array& params, bool fHelp);
@@ -219,5 +229,18 @@ extern json_spirit::Value gettrendinghashtags(const json_spirit::Array& params, 
 extern json_spirit::Value getspamposts(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value torrentstatus(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value search(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value creategroup(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listgroups(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getgroupinfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newgroupinvite(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newgroupdescription(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value leavegroup(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getpieceavailability(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getpiecemaxseen(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value peekpost(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value uidtousername(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value usernametouid(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value newshorturl(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value decodeshorturl(const json_spirit::Array& params, bool fHelp);
 
 #endif

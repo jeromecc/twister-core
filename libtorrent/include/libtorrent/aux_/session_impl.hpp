@@ -105,6 +105,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <mach/mach_host.h>
 #endif
 
+#define HASHCASH_MIN_NBITS 16  // 16 bits ~ 10 ms @ i7 3.50GHz
+#define HASHCASH_MAX_NBITS 31
+
 namespace libtorrent
 {
 
@@ -310,7 +313,7 @@ namespace libtorrent
 			void dht_putDataSigned(std::string const &username, std::string const &resource, bool multi,
 			         entry const &p, std::string const &sig_p, std::string const &sig_user, bool local);
 
-			void dht_getData(std::string const &username, std::string const &resource, bool multi);
+			void dht_getData(std::string const &username, std::string const &resource, bool multi, bool local);
 			entry dht_getLocalData() const;
 
 
@@ -445,7 +448,7 @@ namespace libtorrent
 #endif // TORRENT_NO_DEPRECATE
 
 #ifndef TORRENT_DISABLE_DHT
-			bool is_dht_running() const { return m_dht; }
+			bool is_dht_running() const { return m_dht.get(); }
 #endif
 
 #if TORRENT_USE_I2P
@@ -1143,6 +1146,10 @@ namespace libtorrent
 			// the number of torrents that have apply_ip_filter
 			// set to false. This is typically 0
 			int m_non_filtered_torrents;
+			
+			// hashcash PEEK
+			int m_hashcash_nbits;
+			int m_hashcash_reqs;
 
 #if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING || defined TORRENT_ERROR_LOGGING
 			boost::shared_ptr<logger> create_log(std::string const& name

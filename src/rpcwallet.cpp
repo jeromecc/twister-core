@@ -69,7 +69,7 @@ Value getinfo(const Array& params, bool fHelp)
             "Returns an object containing various state info.");
 
     proxyType proxy;
-    GetProxy(NET_IPV4, proxy);
+    bool usingProxy = GetProxy(NET_IPV4, proxy);
 
     Object obj;
     obj.push_back(Pair("version",       (int)CLIENT_VERSION));
@@ -87,6 +87,10 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("dht_nodes",     getDhtNodes(&dht_global_nodes)));
     obj.push_back(Pair("dht_global_nodes", dht_global_nodes));
     obj.push_back(Pair("proxy",         (proxy.first.IsValid() ? proxy.first.ToStringIPPort() : string())));
+    if( !usingProxy ) {
+        obj.push_back(Pair("ext_port1", GetListenPort()));
+        obj.push_back(Pair("ext_port2", GetListenPort()+LIBTORRENT_PORT_OFFSET));
+    }
     {
         LOCK(cs_main);
         obj.push_back(Pair("difficulty",    (double)GetDifficulty()));
@@ -99,6 +103,10 @@ Value getinfo(const Array& params, bool fHelp)
         obj.push_back(Pair("public_server_mode", GetBoolArg("-public_server_mode",false)));
         obj.push_back(Pair("errors",        GetWarnings("statusbar")));
     }
+
+    const CNetAddr paddrPeer("8.8.8.8");
+    CAddress addr( GetLocalAddress(&paddrPeer) );
+    obj.push_back(Pair("ext_addr_net1", addr.IsValid() ? addr.ToStringIP() : string()) );
 
     Object torrent_stats = getLibtorrentSessionStatus();
     obj.insert( obj.end(), torrent_stats.begin(), torrent_stats.end() );
@@ -168,7 +176,8 @@ Value listwalletusers(const Array& params, bool fHelp)
     LOCK(pwalletMain->cs_wallet);
     BOOST_FOREACH(const PAIRTYPE(CKeyID, CKeyMetadata)& item, pwalletMain->mapKeyMetadata)
     {
-      ret.push_back(item.second.username);
+        if (item.second.username[0] != '*')
+            ret.push_back(item.second.username);
     }
     return ret;
 }

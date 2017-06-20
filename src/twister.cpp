@@ -57,6 +57,7 @@ static map<std::string, bool> m_specialResources;
 enum ExpireResType { SimpleNoExpire, NumberedNoExpire, PostNoExpireRecent };
 static map<std::string, ExpireResType> m_noExpireResources;
 static map<std::string, torrent_handle> m_userTorrent;
+static map<std::string, torrent_handle> m_peekTorrent;
 static boost::scoped_ptr<CLevelDB> m_swarmDb;
 static int m_threadsToJoin;
 
@@ -64,11 +65,16 @@ static CCriticalSection cs_spamMsg;
 static std::string m_preferredSpamLang = "[en]";
 static std::string m_receivedSpamMsgStr;
 static std::string m_receivedSpamUserStr;
+static int         m_receivedSpamHeight;
 static int64       m_lastSpamTime = 0;
 static std::map<std::string,UserData> m_users;
+static std::map<std::string,GroupChat> m_groups;
 
 static CCriticalSection cs_seenHashtags;
 static std::map<std::string,double> m_seenHashtags;
+
+static bool generateOpt = 0;
+static int genproclimit = 1;
 
 const double hashtagHalfLife      = 8*60*60;    // Halve votes within 8 hours (sec)
 const double hashtagExpiration    = 7*24*60*60; // Remove a hashtag from the list after ~ hashtagExpiration*count (sec)
@@ -100,6 +106,7 @@ private:
 
 #define USER_DATA_FILE "user_data"
 #define GLOBAL_DATA_FILE "global_data"
+#define GROUP_DATA_FILE "group_data"
 
 void dhtgetMapAdd(sha1_hash &ih, alert_manager *am)
 {
@@ -132,15 +139,24 @@ void dhtgetMapPost(sha1_hash &ih, const alert &a)
     }
 }
 
-torrent_handle startTorrentUser(std::string const &username, bool following)
+torrent_handle startTorrentUser(std::string const &username, bool following, int peek_single_piece=-1)
 {
     bool userInTxDb = usernameExists(username); // keep this outside cs_twister to avoid deadlock
     boost::shared_ptr<session> ses(m_ses);
     if( !userInTxDb || !ses )
         return torrent_handle();
+    torrent_handle h;
 
     LOCK(cs_twister);
-    if( !m_userTorrent.count(username) ) {
+    if( m_peekTorrent.count(username) ) {
+        /* multiple paralel peek piece operations per torrent not 
+         * currently supported. return invalid handle for subsequent
+         * requests, until current operation completes and torrent
+         * is freed. */
+         return torrent_handle();
+    }
+
+    if( !m_userTorrent.count(username) || peek_single_piece >= 0 ) {
         sha1_hash ih = dhtTargetHash(username, "tracker", "m");
 
         printf("adding torrent for [%s,tracker]\n", username.c_str());
@@ -149,6 +165,7 @@ torrent_handle startTorrentUser(std::string const &username, bool following)
         tparams.name = username;
         boost::filesystem::path torrentPath = GetDataDir() / "swarm";
         tparams.save_path= torrentPath.string();
+        tparams.peek_single_piece = peek_single_piece;
         boost::system::error_code ec;
         boost::filesystem::create_directory(torrentPath, ec);
         if (ec) {
@@ -157,18 +174,25 @@ torrent_handle startTorrentUser(std::string const &username, bool following)
         std::string filename = combine_path(tparams.save_path, to_hex(ih.to_string()) + ".resume");
         load_file(filename.c_str(), tparams.resume_data);
 
-        m_userTorrent[username] = ses->add_torrent(tparams);
-        if( !following ) {
-            m_userTorrent[username].auto_managed(true);
+        h = ses->add_torrent(tparams);
+        if( peek_single_piece < 0 ) {
+            m_userTorrent[username] = h;
+        } else {
+            m_peekTorrent[username] = h;
         }
-        m_userTorrent[username].force_dht_announce();
+        if( !following ) {
+            h.auto_managed(true);
+        }
+        h.force_dht_announce();
+    } else {
+        h = m_userTorrent[username];
     }
     if( following ) {
-        m_userTorrent[username].set_following(true);
-        m_userTorrent[username].auto_managed(false);
-        m_userTorrent[username].resume();
+        h.set_following(true);
+        h.auto_managed(false);
+        h.resume();
     }
-    return m_userTorrent[username];
+    return h;
 }
 
 torrent_handle getTorrentUser(std::string const &username)
@@ -208,13 +232,22 @@ int saveGlobalData(std::string const& filename)
     globalDict["preferredSpamLang"] = m_preferredSpamLang;
     globalDict["receivedSpamMsg"]   = m_receivedSpamMsgStr;
     globalDict["receivedSpamUser"]  = m_receivedSpamUserStr;
+    globalDict["receivedSpamHeight"]= m_receivedSpamHeight;
     globalDict["lastSpamTime"]      = m_lastSpamTime;
-    globalDict["sendSpamMsg"]       = strSpamMessage;
+
+    entry spams(entry::list_t);
+    {
+        LOCK(cs_spamMessages);
+        BOOST_FOREACH(string msg, spamMessages)
+            spams.list().push_back(msg);
+    }
+    globalDict["sendSpamMsg"]       = spams;
     globalDict["sendSpamUser"]      = strSpamUser;
     globalDict["generate"]          = GetBoolArg("-gen", false);
     int genproclimit = GetArg("-genproclimit", -1);
     if( genproclimit > 0 )
         globalDict["genproclimit"]  = genproclimit;
+    globalDict["portUsedLastTime"]  = GetListenPort();
 
     std::vector<char> buf;
     bencode(std::back_inserter(buf), globalDict);
@@ -234,21 +267,29 @@ int loadGlobalData(std::string const& filename)
             m_preferredSpamLang   = userDict.dict_find_string_value("preferredSpamLang");
             m_receivedSpamMsgStr  = userDict.dict_find_string_value("receivedSpamMsg");
             m_receivedSpamUserStr = userDict.dict_find_string_value("receivedSpamUser");
+            m_receivedSpamHeight  = userDict.dict_find_int_value("receivedSpamHeight");
             m_lastSpamTime        = userDict.dict_find_int_value("lastSpamTime");
-            string sendSpamMsg    = userDict.dict_find_string_value("sendSpamMsg");
-            if( sendSpamMsg.size() ) strSpamMessage = sendSpamMsg;
+
+            const lazy_entry *sendSpamMsg    = userDict.dict_find_list("sendSpamMsg");
+            if (sendSpamMsg)
+            {
+                LOCK(cs_spamMessages);
+                for (int i = 0; i < sendSpamMsg->list_size(); i++)
+                    spamMessages.push_back(sendSpamMsg->list_string_value_at(i));
+            }
+            else
+            {
+                string strSSM = userDict.dict_find_string_value("sendSpamMsg");
+                LOCK(cs_spamMessages);
+                if(strSSM.size() && strSSM != strSpamMessage)
+                    spamMessages.push_back(strSSM);
+            }
+
             string sendSpamUser   = userDict.dict_find_string_value("sendSpamUser");
             if( sendSpamUser.size() ) strSpamUser = sendSpamUser;
-            bool generate         = userDict.dict_find_int_value("generate");
-            int genproclimit      = userDict.dict_find_int_value("genproclimit");
-
-            if( generate ) {
-                Array params;
-                params.push_back( generate );
-                if( genproclimit > 0 )
-                    params.push_back( genproclimit );
-                setgenerate(params, false);
-            }
+            generateOpt           = userDict.dict_find_int_value("generate");
+            genproclimit          = userDict.dict_find_int_value("genproclimit");
+            portUsedLastTime      = userDict.dict_find_int_value("portUsedLastTime");
 
             return 0;
         }
@@ -265,7 +306,6 @@ void ThreadWaitExtIP()
     SimpleThreadCounter threadCounter(&cs_twister, &m_threadsToJoin, "wait-extip");
 
     std::string ipStr;
-
     // wait up to 10 seconds for bitcoin to get the external IP
     for( int i = 0; i < 20; i++ ) {
         const CNetAddr paddrPeer("8.8.8.8");
@@ -297,7 +337,7 @@ void ThreadWaitExtIP()
 
     m_ses.reset(new session(*m_swarmDb, fingerprint("TW", LIBTORRENT_VERSION_MAJOR, LIBTORRENT_VERSION_MINOR, 0, 0)
             , session::add_default_plugins
-            , alert::dht_notification
+            , alert::dht_notification | alert::status_notification
             , ipStr.size() ? ipStr.c_str() : NULL
             , !m_usingProxy ? std::make_pair(listen_port, listen_port) : std::make_pair(0, 0) ));
     boost::shared_ptr<session> ses(m_ses);
@@ -353,7 +393,7 @@ void ThreadWaitExtIP()
     
     session_settings settings("twisterd/"+FormatFullVersion());
     // settings to test local connections
-    settings.allow_multiple_connections_per_ip = true;
+    settings.allow_multiple_connections_per_ip = GetBoolArg("-multiconnperip", false);
     //settings.enable_outgoing_utp = false; // (false to see connections in netstat)
     //settings.dht_announce_interval = 60; // test
     //settings.min_announce_interval = 60; // test
@@ -381,6 +421,9 @@ void ThreadWaitExtIP()
     settings.active_limit         = 25;
     settings.unchoke_slots_limit  = 20;
     settings.auto_manage_interval = 30;
+    // dht upload rate limit (enforced only for non-locally generated requests)
+    // limits: DHT replies, refreshes of stored items, checking for status/tracker and proxy server.
+    settings.dht_upload_rate_limit = 16000;
     ses->set_settings(settings);
 
     printf("libtorrent + dht started\n");
@@ -392,9 +435,14 @@ void ThreadWaitExtIP()
         if( ss.dht_nodes )
             break;
     }
-
-    boost::filesystem::path globalDataPath = GetDataDir() / GLOBAL_DATA_FILE;
-    loadGlobalData(globalDataPath.string());
+    
+    if( generateOpt ) {
+        Array params;
+        params.push_back( generateOpt );
+        if( genproclimit > 0 )
+            params.push_back( genproclimit );
+        setgenerate(params, false);
+    }
 
     std::set<std::string> torrentsToStart;
     {
@@ -403,11 +451,23 @@ void ThreadWaitExtIP()
         loadUserData(userDataPath.string(), m_users);
         printf("loaded user_data for %zd users\n", m_users.size());
 
+        boost::filesystem::path groupDataPath = GetDataDir() / GROUP_DATA_FILE;
+        loadGroupData(groupDataPath.string(), m_groups);
+
         // add all user torrents to a std::set (all m_following)
         std::map<std::string,UserData>::const_iterator i;
         for (i = m_users.begin(); i != m_users.end(); ++i) {
             UserData const &data = i->second;
             BOOST_FOREACH(string username, data.m_following) {
+                torrentsToStart.insert(username);
+            }
+        }
+        
+        // add torrents from groups
+        std::map<std::string,GroupChat>::const_iterator j;
+        for (j = m_groups.begin(); j != m_groups.end(); ++j) {
+            GroupChat const &data = j->second;
+            BOOST_FOREACH(string username, data.m_members) {
                 torrentsToStart.insert(username);
             }
         }
@@ -422,7 +482,7 @@ void ThreadWaitExtIP()
 bool isBlockChainUptodate() {
     if( !pindexBest )
         return false;
-    return (pindexBest->GetBlockTime() > GetTime() - 2 * 60 * 60);
+    return (pindexBest->GetBlockTime() > GetTime() - 24 * 60 * 60);
 }
 
 bool yes(libtorrent::torrent_status const&)
@@ -469,6 +529,10 @@ void lockAndSaveUserData()
         printf("saving user_data (followers and DMs)...\n");
         boost::filesystem::path userDataPath = GetDataDir() / USER_DATA_FILE;
         saveUserData(userDataPath.string(), m_users);
+    }
+    if( m_groups.size() ) {
+        boost::filesystem::path groupDataPath = GetDataDir() / GROUP_DATA_FILE;
+        saveGroupData(groupDataPath.string(), m_groups);
     }
 }
 
@@ -785,7 +849,7 @@ void ThreadSessionAlerts()
                                                    t->string().c_str());
 #endif
                                             neighborCheck[ih] = false;
-                                            dhtGetData(n->string(), r->string(), t->string() == "m");
+                                            dhtGetData(n->string(), r->string(), t->string() == "m", false);
                                         } else if( neighborCheck[ih] ) {
                                             sha1_hash ihStatus = dhtTargetHash(n->string(), "status", "s");
 
@@ -796,7 +860,7 @@ void ThreadSessionAlerts()
                                                         n->string().c_str(), "status", "s");
 #endif
                                                 statusCheck[ihStatus] = GetTime();
-                                                dhtGetData(n->string(), "status", false);
+                                                dhtGetData(n->string(), "status", false, false);
                                             }
                                         }
                                     }
@@ -832,7 +896,7 @@ void ThreadSessionAlerts()
 #endif
                             sha1_hash ihStatus = dhtTargetHash(dd->m_username, "status", "s");
                             statusCheck[ihStatus] = GetTime();
-                            dhtGetData(dd->m_username, "status", false);
+                            dhtGetData(dd->m_username, "status", false, false);
                         }
                     }
                     if( statusCheck.count(ih) ) {
@@ -845,19 +909,47 @@ void ThreadSessionAlerts()
 
                 save_resume_data_alert const* rda = alert_cast<save_resume_data_alert>(*i);
                 if (rda) {
-                    num_outstanding_resume_data--;
-                    if (!rda->resume_data) continue;
-
-                    torrent_handle h = rda->handle;
-                    torrent_status st = h.status(torrent_handle::query_save_path);
-                    std::vector<char> out;
-                    bencode(std::back_inserter(out), *rda->resume_data);
-                    save_file(combine_path(st.save_path, to_hex(st.info_hash.to_string()) + ".resume"), out);
+                    if (rda->resume_data) {
+                        torrent_handle h = rda->handle;
+                        torrent_status st = h.status(torrent_handle::query_save_path);
+                        std::vector<char> out;
+                        bencode(std::back_inserter(out), *rda->resume_data);
+                        save_file(combine_path(st.save_path, to_hex(st.info_hash.to_string()) + ".resume"), out);
+                    }
                 }
 
-                if (alert_cast<save_resume_data_failed_alert>(*i))
+                save_resume_data_failed_alert const *rdfa = alert_cast<save_resume_data_failed_alert>(*i);
+                if (rda || rdfa)
                 {
-                    --num_outstanding_resume_data;
+                    torrent_handle h = (rda) ? rda->handle : rdfa->handle;
+                    torrent_status st = h.status();
+                    LOCK(cs_twister);
+                    num_outstanding_resume_data--;
+                    if(m_peekTorrent.count(st.name) && st.paused) {
+                        m_peekTorrent.erase(st.name);
+                        ses->remove_torrent(h);
+                    }
+                }
+
+                external_ip_alert const* ei = alert_cast<external_ip_alert>(*i);
+                if (ei)
+                {
+                    boost::system::error_code ec;
+                    std::string extip = ei->external_address.to_string(ec);
+                    
+                    printf("Learned new external IP from DHT peers: %s\n", extip.c_str());
+                    CNetAddr addrLocalHost(extip);
+                    
+                    // pretend it came from querying http server. try voting up to 10 times
+                    // to change current external ip in bitcoin code.
+                    for(int i=0; i < 10; i++) {
+                        AddLocal(addrLocalHost, LOCAL_HTTP);
+                        const CNetAddr paddrPeer("8.8.8.8");
+                        CAddress addr( GetLocalAddress(&paddrPeer) );
+                        if( addr.IsValid() && addr.ToStringIP() == extip)
+                            break;
+                    }
+                    continue;
                 }
         }
     }
@@ -889,6 +981,12 @@ void ThreadHashtagsAging()
             MilliSleep(1000);
         }
     }
+}
+
+void preinitSessionTorrent()
+{
+    boost::filesystem::path globalDataPath = GetDataDir() / GLOBAL_DATA_FILE;
+    loadGlobalData(globalDataPath.string());
 }
 
 void startSessionTorrent(boost::thread_group& threadGroup)
@@ -1055,10 +1153,188 @@ bool verifySignature(std::string const &strMessage, std::string const &strUserna
     return (pubkeyRec.GetID() == pubkey.GetID());
 }
 
+void storeNewDM(const string &localuser, const string &dmUser, const StoredDirectMsg &stoDM)
+{
+    LOCK(cs_twister);
+    // store this dm in memory list, but prevent duplicates
+    std::vector<StoredDirectMsg> &dmsFromToUser = m_users[localuser].
+                                  m_directmsg[dmUser];
+    std::vector<StoredDirectMsg>::iterator it;
+    for( it = dmsFromToUser.begin(); it != dmsFromToUser.end(); ++it ) {
+        if( stoDM.m_utcTime == (*it).m_utcTime &&
+            stoDM.m_text    == (*it).m_text ) {
+            break;
+        }
+        if( stoDM.m_utcTime <= (*it).m_utcTime ) {
+            dmsFromToUser.insert(it, stoDM);
+            break;
+        }
+    }
+    if( it == dmsFromToUser.end() ) {
+        dmsFromToUser.push_back(stoDM);
+    }
+}
+
+void storeGroupDM(const string &groupAlias, const StoredDirectMsg &stoDM)
+{
+    LOCK(cs_twister);
+    if( !m_groups.count(groupAlias) )
+        return;
+    GroupChat &group = m_groups[groupAlias];
+
+    BOOST_FOREACH(string const &member, group.m_members) {
+        if( m_users.count(member) && !m_users.at(member).m_ignoreGroups.count(groupAlias) ) {
+            storeNewDM(member,groupAlias,stoDM);
+        }
+    }
+}
+
+string getGroupAliasByKey(const string &privKey)
+{
+    string groupAlias;
+    LOCK(cs_twister);
+    map<string,GroupChat>::iterator i;
+    for (i = m_groups.begin(); i != m_groups.end(); ++i) {
+        if( i->second.m_privKey == privKey ) {
+            groupAlias = i->first;
+            break;
+        }
+    }
+    return groupAlias;
+}
+
+void registerNewGroup(const string &privKey, const string &desc, const string &member, const string &invitedBy, int64_t utcTime, int k)
+{
+    string groupAlias = getGroupAliasByKey(privKey);
+
+    CBitcoinSecret vchSecret;
+    bool fGood = vchSecret.SetString(privKey);
+    if (!fGood) {
+        printf("registerGroupMember: Invalid private key\n");
+        return;
+    }
+    CKey key = vchSecret.GetKey();
+    CPubKey pubkey = key.GetPubKey();
+    CKeyID vchAddress = pubkey.GetID();
+    {
+        LOCK(pwalletMain->cs_wallet);
+        if (pwalletMain->HaveKey(vchAddress)) {
+            // already exists? reuse same alias (trying to fix inconsistency wallet x groups)
+            groupAlias = pwalletMain->mapKeyMetadata[vchAddress].username;
+            if( !groupAlias.length() || groupAlias.at(0) != '*' ) {
+                printf("registerGroupMember: Invalid group alias '%s' from wallet\n", groupAlias.c_str());
+                return;
+            }
+        } else if (!groupAlias.length()) {
+            groupAlias = getRandomGroupAlias();
+        }
+
+        pwalletMain->mapKeyMetadata[vchAddress] = CKeyMetadata(GetTime(), groupAlias);
+        if (!pwalletMain->AddKeyPubKey(key, pubkey)) {
+            printf("registerGroupMember: Error adding key to wallet\n");
+            return;
+        }
+    }
+
+    LOCK(cs_twister);
+    GroupChat &group = m_groups[groupAlias];
+    group.m_description = desc;
+    group.m_privKey     = privKey;
+
+    if( member.length() ) {
+        if( member == groupAlias ) {
+            StoredDirectMsg stoDM;
+            stoDM.m_fromMe  = false;
+            stoDM.m_from    = invitedBy;
+            stoDM.m_k       = k;
+            // temporary hack: we must add new fields to StoredDirectMsg so text may be translated by UI
+            stoDM.m_text    = "*** '" + invitedBy + "' changed group description to: " + desc;
+            stoDM.m_utcTime = utcTime;
+            storeGroupDM(groupAlias,stoDM);
+        } else {
+            group.m_members.insert(member);
+            
+            if( m_users.count(member) && !m_users.at(member).m_ignoreGroups.count(groupAlias) ) {
+                StoredDirectMsg stoDM;
+                stoDM.m_fromMe  = false;
+                stoDM.m_from    = invitedBy;
+                stoDM.m_k       = k;
+                // temporary hack: we must add new fields to StoredDirectMsg so text may be translated by UI
+                stoDM.m_text    = "*** Invited by '" + invitedBy + "' to group: " + desc;
+                stoDM.m_utcTime = utcTime;
+                storeNewDM(member,groupAlias,stoDM);
+            }
+        }
+    }
+}
+
+void notifyNewGroupMember(string &groupAlias, string &newmember, string &invitedBy, int64_t utcTime, int k)
+{
+    LOCK(cs_twister);
+    if( !m_groups.count(groupAlias) )
+        return;
+
+    GroupChat &group = m_groups[groupAlias];
+
+    if( group.m_members.count(newmember) )
+        return;
+
+    group.m_members.insert(newmember);
+
+    StoredDirectMsg stoDM;
+    stoDM.m_fromMe  = false;
+    stoDM.m_from    = invitedBy;
+    stoDM.m_k       = k;
+    // temporary hack: we must add new fields to StoredDirectMsg so text may be translated by UI
+    stoDM.m_text    = "*** New member '" + newmember + "' invited by '" + invitedBy + "'";
+    stoDM.m_utcTime = utcTime;
+    storeGroupDM(groupAlias,stoDM);
+}
+
+// dispatch new msg for mentions and hashtags
+void dispatchHM(string const &strMsg, string const &strUsername, entry const &v)
+{
+    if (strMsg.size() == 0)
+        return;
+    // split and look for mentions and hashtags
+    vector<string> tokens;
+    boost::algorithm::split(tokens,strMsg,boost::algorithm::is_any_of(msgTokensDelimiter),
+                            boost::algorithm::token_compress_on);
+    BOOST_FOREACH(string const& token, tokens) {
+        if( token.length() >= 2 ) {
+            char delim = token.at(0);
+            if( delim != '#' && delim != '@' ) continue;
+            string target = (delim == '#') ? "hashtag" : "mention";
+            string word = token.substr(1);
+#ifdef HAVE_BOOST_LOCALE
+            word = boost::locale::to_lower(word);
+#else
+            boost::algorithm::to_lower(word);
+#endif
+            if( word.find(delim) == string::npos ) {
+                dhtPutData(word, target, true,
+                                 v, strUsername, GetAdjustedTime(), 0);
+            } else {
+                vector<string> subtokens;
+                boost::algorithm::split(subtokens,word,std::bind1st(std::equal_to<char>(),delim),
+                                        boost::algorithm::token_compress_on);
+                BOOST_FOREACH(string const& word, subtokens) {
+                    if( word.length() ) {
+                        dhtPutData(word, target, true,
+                                         v, strUsername, GetAdjustedTime(), 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // try decrypting new DM received by any torrent we follow
 bool processReceivedDM(lazy_entry const* post)
 {
     bool result = false;
+
+    std::set<std::string> torrentsToStart;
 
     lazy_entry const* dm = post->dict_find_dict("dm");
     if( dm ) {
@@ -1073,7 +1349,7 @@ bool processReceivedDM(lazy_entry const* post)
         {
             CKey key;
             if (!pwalletMain->GetKey(item.first, key)) {
-                printf("acceptSignedPost: private key not available trying to decrypt DM.\n");
+                printf("processReceivedDM: private key not available trying to decrypt DM.\n");
             } else {
                 std::string textOut;
                 if( key.Decrypt(sec, textOut) ) {
@@ -1084,10 +1360,26 @@ bool processReceivedDM(lazy_entry const* post)
                            textOut.c_str());
                     */
 
-                    std::string from   = post->dict_find_string_value("n");
-                    std::string to     = item.second.username; // default (old format)
-                    std::string msg    = textOut;              // default (old format)
-                    bool        fromMe = (from == to);
+                    int64_t     utcTime = post->dict_find_int_value("time");
+                    std::string from    = post->dict_find_string_value("n");
+                    int         k       = post->dict_find_int_value("k",-1);
+                    std::string to      = item.second.username; // default (old format)
+                    std::string msg     = textOut;              // default (old format)
+                    bool        fromMe  = (from == to);
+                    bool        isGroup = false;
+
+                    {
+                        LOCK(cs_twister);
+                        isGroup = m_groups.count(to);
+                        if( !isGroup && m_users.count(to) &&
+                            !m_users.at(to).m_following.count(from) ) {
+                            /* DM not allowed from users we don't follow.*/
+                            printf("processReceivedDM: from '%s' to '%s' not allowed (not following)\n",
+                                   from.c_str(), to.c_str());
+                            break;
+                        }
+                    }
+
                     // try bdecoding the new format (copy to self etc)
                     {
                         lazy_entry v;
@@ -1095,6 +1387,34 @@ bool processReceivedDM(lazy_entry const* post)
                         libtorrent::error_code ec;
                         if (lazy_bdecode(textOut.data(), textOut.data()+textOut.size(), v, ec, &pos) == 0
                                 && v.type() == lazy_entry::dict_t) {
+
+                            /* group_invite: register new private key and group's description.
+                             * if sent to groupalias then it is a change description request. */
+                            lazy_entry const* pGroupInvite = v.dict_find_dict("group_invite");
+                            if (pGroupInvite) {
+                                lazy_entry const* pDesc = pGroupInvite->dict_find_string("desc");
+                                lazy_entry const* pKey  = pGroupInvite->dict_find_string("key");
+                                if (pDesc && pKey) {
+                                    string desc     = pDesc->string_value();
+                                    string privKey  = pKey->string_value();
+                                    registerNewGroup(privKey, desc, to, from, utcTime, k);
+                                }
+                                break;
+                            }
+
+                            /* update group members list. we may need to start torrent for
+                             * new members to receive their chat updates */
+                            lazy_entry const* pGroupMembers = v.dict_find_list("group_members");
+                            if (pGroupMembers && isGroup) {
+                                for (int i = 0; i < pGroupMembers->list_size(); ++i) {
+                                    std::string member = pGroupMembers->list_string_value_at(i);
+                                    if (member.empty()) continue;
+                                    notifyNewGroupMember(to, member, from, utcTime, k);
+                                    torrentsToStart.insert(member);
+                                }
+                                break;
+                            }
+
                             lazy_entry const* pMsg = v.dict_find_string("msg");
                             lazy_entry const* pTo  = v.dict_find_string("to");
                             if (pMsg && pTo) {
@@ -1110,33 +1430,27 @@ bool processReceivedDM(lazy_entry const* post)
 
                     StoredDirectMsg stoDM;
                     stoDM.m_fromMe  = fromMe;
+                    stoDM.m_from    = from;
+                    stoDM.m_k       = k;
                     stoDM.m_text    = msg;
-                    stoDM.m_utcTime = post->dict_find_int_value("time");
+                    stoDM.m_utcTime = utcTime;
 
-                    LOCK(cs_twister);
-                    // store this dm in memory list, but prevent duplicates
-                    std::vector<StoredDirectMsg> &dmsFromToUser = m_users[item.second.username].
-                                                  m_directmsg[fromMe ? to : from];
-                    std::vector<StoredDirectMsg>::iterator it;
-                    for( it = dmsFromToUser.begin(); it != dmsFromToUser.end(); ++it ) {
-                        if( stoDM.m_utcTime == (*it).m_utcTime &&
-                            stoDM.m_text    == (*it).m_text ) {
-                            break;
-                        }
-                        if( stoDM.m_utcTime < (*it).m_utcTime ) {
-                            dmsFromToUser.insert(it, stoDM);
-                            break;
-                        }
+                    if( isGroup ) {
+                        storeGroupDM(item.second.username, stoDM);
+                    } else {
+                        storeNewDM(item.second.username, fromMe ? to : from, stoDM);
                     }
-                    if( it == dmsFromToUser.end() ) {
-                        dmsFromToUser.push_back(stoDM);
-                    }
-
                     break;
                 }
             }
         }
     }
+
+    // start torrents outside cs_wallet to prevent deadlocks
+    BOOST_FOREACH(string username, torrentsToStart) {
+        startTorrentUser(username, true);
+    }
+
     return result;
 }
 
@@ -1241,11 +1555,30 @@ bool acceptSignedPost(char const *data, int data_size, std::string username, int
                             }
                         }
 
+                        lazy_entry const* fav = post->dict_find_dict("fav");
+                        string sig_fav = post->dict_find_string_value("sig_fav");
+
+                        if ( fav ) {
+                            if ( flags )
+                                (*flags) |= USERPOST_FLAG_FAV;
+                            string username_fav = fav->dict_find_string_value("n");
+                            int height_fav = fav->dict_find_int_value("height", -1);
+
+                            pair<char const*, int> favbuf = fav->data_section();
+                            ret = verifySignature(string(favbuf.first, favbuf.second),
+                                                  username_fav, sig_fav, height_fav);
+                            if ( !ret )
+                                sprintf(errbuf, "bad FAV signature");
+                        }
+
                         if( flags ) {
                             lazy_entry const* dm = post->dict_find_dict("dm");
+                            lazy_entry const* pfav = post->dict_find_dict("pfav");
                             if( dm ) {
                                 (*flags) |= USERPOST_FLAG_DM;
                                 processReceivedDM(post);
+                            } else if (pfav) {
+                                (*flags) |= USERPOST_FLAG_P_FAV;
                             } else {
                                 processReceivedPost(v, username, time, msg);
                             }
@@ -1314,11 +1647,9 @@ bool usernameExists(std::string const &username)
 */
 
 bool createSignedUserpost(entry &v, std::string const &username, int k,
-                          std::string const &msg,               // either msg.size() or
-                          entry const *rt, entry const *sig_rt, // rt != NULL or
-                          entry const *dm,                      // dm != NULL.
-                          std::string const &reply_n, int reply_k
-                          )
+                          int flag, std::string const &msg,
+                          entry const *ent, entry const *sig_rtfav,
+                          std::string const &reply_n = "", int reply_k = 0)
 {
     entry &userpost = v["userpost"];
 
@@ -1328,19 +1659,66 @@ bool createSignedUserpost(entry &v, std::string const &username, int k,
     userpost["time"] = GetAdjustedTime();
     userpost["height"] = getBestHeight() - 1; // be conservative
 
-    if( msg.size() ) {
-        //userpost["t"] = "post";
+    int msgUtf8Chars = utf8::num_characters(msg.begin(), msg.end());
+    if(msgUtf8Chars < 0) {
+        return false; // invalid utf8
+    } else if (msgUtf8Chars && msgUtf8Chars <= 140) {
         userpost["msg"] = msg;
-    } else if ( rt != NULL && sig_rt != NULL ) {
-        //userpost["t"] = "rt";
-        userpost["rt"] = *rt;
-        userpost["sig_rt"] = *sig_rt;
-    } else if ( dm != NULL ) {
-        //userpost["t"] = "dm";
-        userpost["dm"] = *dm;
     } else {
-        printf("createSignedUserpost: unknown type\n");
-        return false;
+        // break into msg and msg2 fields to overcome 140ch checks
+        string::const_iterator it = msg.begin();
+        string::const_iterator end = msg.end();
+        string msgOut, msg2Out;
+        int count = 0;
+        while (it!= end) {
+            string::const_iterator itPrev = it;
+            utf8::internal::utf_error err_code = utf8::internal::validate_next(it, end);
+            assert(err_code == utf8::internal::UTF8_OK); // string must have been validated already
+            count++;
+            if( count <= 140 ) {
+                msgOut.append(itPrev,it);
+            } else {
+                msg2Out.append(itPrev,it);
+            }
+        }
+        userpost["msg"] = msgOut;
+        userpost["msg2"] = msg2Out;
+    }
+
+    switch(flag)
+    {
+    case USERPOST_FLAG_RT:
+    {
+        if (msg.size())
+        {
+            std::vector<char> buf;
+            bencode(std::back_inserter(buf), userpost);
+            std::string sig = createSignature(std::string(buf.data(),buf.size()), username);
+            if(sig.size())
+            {
+                v["sig_wort"] = sig;
+            } else {
+                return false;
+            }
+        }
+        //userpost["t"] = "rt";
+        userpost["rt"] = *ent;
+        userpost["sig_rt"] = *sig_rtfav;
+        break;
+    }
+    case USERPOST_FLAG_FAV:
+        userpost["fav"] = *ent;
+        userpost["sig_fav"] = *sig_rtfav;
+        break;
+    case USERPOST_FLAG_DM:
+        //userpost["t"] = "dm";
+        userpost["dm"] = *ent;
+        break;
+    case USERPOST_FLAG_P_FAV:
+        userpost["pfav"] = *ent;
+        break;
+    default:
+        break;
     }
 
     if( reply_n.size() ) {
@@ -1364,7 +1742,13 @@ bool createSignedUserpost(entry &v, std::string const &username, int k,
 bool createDirectMessage(entry &dm, std::string const &to, std::string const &msg)
 {
     CPubKey pubkey;
-    if( !getUserPubKey(to, pubkey) ) {
+    
+    /* try obtaining key from wallet first */
+    CKeyID keyID;
+    if (pwalletMain->GetKeyIdFromUsername(to, keyID) &&
+        pwalletMain->GetPubKey( keyID, pubkey) ) {
+        /* success: key obtained from wallet */
+    } else if( !getUserPubKey(to, pubkey) ) {
       printf("createDirectMessage: no pubkey for user '%s'\n", to.c_str());
       return false;
     }
@@ -1466,7 +1850,7 @@ void receivedSpamMessage(std::string const &message, std::string const &user)
 {
     LOCK(cs_spamMsg);
     bool hasSingleLangCode = (message.find("[") == message.rfind("["));
-    bool hasPreferredLang  = m_preferredSpamLang.length();
+    bool hasPreferredLang  = m_preferredSpamLang.length() > 2;
     bool isSameLang        = hasPreferredLang && hasSingleLangCode &&
                              message.find(m_preferredSpamLang) != string::npos;
     bool currentlyEmpty    = !m_receivedSpamMsgStr.length();
@@ -1474,6 +1858,7 @@ void receivedSpamMessage(std::string const &message, std::string const &user)
     if( currentlyEmpty || (isSameLang && rand() < (RAND_MAX/2)) ) {
         m_receivedSpamMsgStr = message;
         m_receivedSpamUserStr = user;
+        m_receivedSpamHeight = nBestHeight;
     }
 }
 
@@ -1539,14 +1924,12 @@ entry formatSpamPost(const string &msg, const string &username, uint64_t utcTime
     userpost["height"] = height ? height : getBestHeight();
     userpost["msg"] = msg;
     
-    unsigned char vchSig[65];
-    RAND_bytes(vchSig,sizeof(vchSig));
-    v["sig_userpost"] = HexStr( string((const char *)vchSig, sizeof(vchSig)) );
+    v["sig_userpost"] = "";
     return v;
 }
 
 
-void dhtGetData(std::string const &username, std::string const &resource, bool multi)
+void dhtGetData(std::string const &username, std::string const &resource, bool multi, bool local)
 {
     if( DhtProxy::fEnabled ) {
         printf("dhtGetData: not allowed - using proxy (bug!)\n");
@@ -1557,7 +1940,7 @@ void dhtGetData(std::string const &username, std::string const &resource, bool m
         printf("dhtGetData: libtorrent session not ready\n");
         return;
     }
-    ses->dht_getData(username,resource,multi);
+    ses->dht_getData(username,resource,multi,local);
 }
 
 void dhtPutData(std::string const &username, std::string const &resource, bool multi,
@@ -1651,6 +2034,62 @@ Value dhtput(const Array& params, bool fHelp)
     return Value();
 }
 
+Value dhtputraw(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "dhtputraw <hexdata>\n"
+            "Store resource in dht network");
+
+    string hexdata = params[0].get_str();
+
+    vector<unsigned char> vch = ParseHex(hexdata);
+
+    lazy_entry dhtroot;
+    int pos;
+    libtorrent::error_code ec;
+    if (lazy_bdecode((const char *)vch.data(), (const char *)vch.data()+vch.size(), dhtroot, ec, &pos) != 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"hexdata failed to bdecode");
+    }
+    if( dhtroot.type() != lazy_entry::dict_t) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"root not dict type");
+    }
+    lazy_entry const* p = dhtroot.dict_find_dict("p");
+    if( !p ) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"missing 'p' entry");
+    }
+    lazy_entry const* target = p->dict_find_dict("target");
+    if( !target ) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"missing 'target' entry");
+    }
+
+    string username = target->dict_find_string_value("n");
+    string resource = target->dict_find_string_value("r");
+    bool multi = target->dict_find_string_value("t") == "m";
+
+    string sig_p = dhtroot.dict_find_string_value("sig_p");
+    if( !sig_p.length() ) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"missing 'sig_p' entry");
+    }
+
+    string sig_user = dhtroot.dict_find_string_value("sig_user");
+    if( !sig_user.length() ) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"missing 'sig_user' entry");
+    }
+
+    std::pair<char const*, int> pbuf = p->data_section();
+    if (!verifySignature(std::string(pbuf.first,pbuf.second),
+                sig_user,sig_p)) {
+        throw JSONRPCError(RPC_INVALID_PARAMS,"invalid signature");
+    }
+
+    entry pEntry;
+    pEntry = *p;
+    dhtPutDataSigned(username, resource, multi,
+                     pEntry, sig_p, sig_user, true);
+    return Value();
+}
+
 Value dhtget(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() < 3 || params.size() > 6)
@@ -1685,7 +2124,7 @@ Value dhtget(const Array& params, bool fHelp)
     vector<CNode*> dhtProxyNodes;
     if( !DhtProxy::fEnabled ) {
         dhtgetMapAdd(ih, &am);
-        dhtGetData(strUsername, strResource, multi);
+        dhtGetData(strUsername, strResource, multi, true);
     } else {
         DhtProxy::dhtgetMapAdd(ih, &am);
         dhtProxyNodes = DhtProxy::dhtgetStartRequest(strUsername, strResource, multi);
@@ -1753,14 +2192,15 @@ int findLastPublicPostLocalUser( std::string strUsername )
         std::vector<std::string> pieces;
         int max_id = std::numeric_limits<int>::max();
         int since_id = -1;
-        h.get_pieces(pieces, 1, max_id, since_id, ~USERPOST_FLAG_DM);
+        h.get_pieces(pieces, 1, max_id, since_id, USERPOST_FLAG_HOME, 0);
 
         if( pieces.size() ) {
             string const& piece = pieces.front();
             lazy_entry v;
             int pos;
             libtorrent::error_code ec;
-            if (lazy_bdecode(piece.data(), piece.data()+piece.size(), v, ec, &pos) == 0) {
+            if (lazy_bdecode(piece.data(), piece.data()+piece.size(), v, ec, &pos) == 0 &&
+                v.type() == lazy_entry::dict_t) {
                 lazy_entry const* post = v.dict_find_dict("userpost");
                 lastk = post->dict_find_int_value("k",-1);
             }
@@ -1798,9 +2238,9 @@ Value newpostmsg(const Array& params, bool fHelp)
     if( lastk >= 0 )
         v["userpost"]["lastk"] = lastk;
 
-    if( !createSignedUserpost(v, strUsername, k, strMsg,
-                         NULL, NULL, NULL,
-                         strReplyN, replyK) )
+    if( !createSignedUserpost(v, strUsername, k, 0,
+                              strMsg, NULL, NULL,
+                              strReplyN, replyK) )
         throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
 
     vector<char> buf;
@@ -1832,40 +2272,104 @@ Value newpostmsg(const Array& params, bool fHelp)
                          v, strUsername, GetAdjustedTime(), 0);
     }
 
-    // split and look for mentions and hashtags
-    vector<string> tokens;
-    boost::algorithm::split(tokens,strMsg,boost::algorithm::is_any_of(msgTokensDelimiter),
-                            boost::algorithm::token_compress_on);
-    BOOST_FOREACH(string const& token, tokens) {
-        if( token.length() >= 2 ) {
-            char delim = token.at(0);
-            if( delim != '#' && delim != '@' ) continue;
-            string target = (delim == '#') ? "hashtag" : "mention";
-            string word = token.substr(1);
-#ifdef HAVE_BOOST_LOCALE
-            word = boost::locale::to_lower(word);
-#else
-            boost::algorithm::to_lower(word);
-#endif
-            if( word.find(delim) == string::npos ) {
-                dhtPutData(word, target, true,
-                                 v, strUsername, GetAdjustedTime(), 0);
-            } else {
-                vector<string> subtokens;
-                boost::algorithm::split(subtokens,word,std::bind1st(std::equal_to<char>(),delim),
-                                        boost::algorithm::token_compress_on);
-                BOOST_FOREACH(string const& word, subtokens) {
-                    if( word.length() ) {
-                        dhtPutData(word, target, true,
-                                         v, strUsername, GetAdjustedTime(), 0);
-                    }
-                }
-            }
+    //look for mentions and hashtags in msg
+    dispatchHM(strMsg, strUsername, v);
+
+    hexcapePost(v);
+    return entryToJson(v);
+}
+
+Value newpostcustom(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 3)
+        throw runtime_error(
+            "newpostcustom <username> <k> '{\"field1\":value,\"field2\":value,...}'\n"
+            "Create a post with custom fields and add it to swarm");
+
+    EnsureWalletIsUnlocked();
+
+    string strUsername = params[0].get_str();
+    int k              = params[1].get_int();
+    string strK        = boost::lexical_cast<std::string>(k);
+    Object fields      = params[2].get_obj();
+
+    entry v;
+    entry &userpost = v["userpost"];
+    // [MF] Warning: findLastPublicPostLocalUser requires that we follow ourselves
+    int lastk = findLastPublicPostLocalUser(strUsername);
+    if( lastk >= 0 )
+        userpost["lastk"] = lastk;
+
+    for (Object::const_iterator i = fields.begin(); i != fields.end(); ++i) {
+        if( i->value_.type() == str_type ) {
+            userpost[i->name_] = i->value_.get_str();
+        } else if ( i->value_.type() == int_type ) {
+            userpost[i->name_] = i->value_.get_int();
+        } else {
+            JSONRPCError(RPC_INVALID_PARAMS,string("unknown type for parameter: ") + i->name_);
         }
+    }
+
+    if( !createSignedUserpost(v, strUsername, k, 0,
+                              "", NULL, NULL) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
+
+    vector<char> buf;
+    bencode(std::back_inserter(buf), v);
+
+    std::string errmsg;
+    if( !acceptSignedPost(buf.data(),buf.size(),strUsername,k,errmsg,NULL) )
+        throw JSONRPCError(RPC_INVALID_PARAMS,errmsg);
+
+    torrent_handle h = startTorrentUser(strUsername, true);
+    if( h.is_valid() ) {
+        // if member of torrent post it directly
+        h.add_piece(k,buf.data(),buf.size());
+    } else {
+        // TODO: swarm resource forwarding not implemented
+        dhtPutData(strUsername, "swarm", false,
+                         v, strUsername, GetAdjustedTime(), 1);
+    }
+
+    // post to dht as well
+    dhtPutData(strUsername, string("post")+strK, false,
+                     v, strUsername, GetAdjustedTime(), 1);
+    if( userpost.find_key("msg") ) {
+        dhtPutData(strUsername, string("status"), false,
+                         v, strUsername, GetAdjustedTime(), k);
+        //look for mentions and hashtags in msg
+        dispatchHM(userpost["msg"].string(), strUsername, v);
     }
 
     hexcapePost(v);
     return entryToJson(v);
+}
+
+Value newpostraw(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 3)
+        throw runtime_error(
+            "newpostraw <username> <k> <hexdata>\n"
+            "Post a new raw post (already signed) to swarm");
+
+    string strUsername = params[0].get_str();
+    int k              = params[1].get_int();
+    string hexdata     = params[2].get_str();
+
+    vector<unsigned char> buf = ParseHex(hexdata);
+
+    std::string errmsg;
+    if( !acceptSignedPost((const char *)buf.data(),buf.size(),strUsername,k,errmsg,NULL) )
+        throw JSONRPCError(RPC_INVALID_PARAMS,errmsg);
+
+    torrent_handle h = getTorrentUser(strUsername);
+    if( h.is_valid() ) {
+        // if member of torrent post it directly
+        h.add_piece(k,(const char *)buf.data(),buf.size());
+    } else {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,"swarm resource forwarding not implemented");
+    }
+    return Value();
 }
 
 Value newdirectmsg(const Array& params, bool fHelp)
@@ -1893,44 +2397,37 @@ Value newdirectmsg(const Array& params, bool fHelp)
     bencode(std::back_inserter(payloadbuf), payloadNewFormat);
     std::string strMsgData = std::string(payloadbuf.data(),payloadbuf.size());
 
-    if( copySelf ) {
-        // add padding to strMsg so both DMs will have exactly the same size.
-        // should be removed in future when all clients move to new format.
-        while( strMsg.length() < strMsgData.length() ) {
-            strMsg.push_back(' ');
-        }
-    }
-
-    entry dmOldFormat;
-    if( !createDirectMessage(dmOldFormat, strTo, strMsg) )
+    entry dmRcpt;
+    if( !createDirectMessage(dmRcpt, strTo, strMsgData) )
         throw JSONRPCError(RPC_INTERNAL_ERROR,
                            "error encrypting to pubkey of destination user");
 
-    entry dmNewFormat;
+    entry dmSelf;
     if( copySelf ) {
         // use new format to send a copy to ourselves. in future, message
         // to others might use the new format as well.
-        if( !createDirectMessage(dmNewFormat, strFrom, strMsgData) )
+        if( !createDirectMessage(dmSelf, strFrom, strMsgData) )
             throw JSONRPCError(RPC_INTERNAL_ERROR,
-                               "error encrypting to pubkey of destination user");
+                               "error encrypting to pubkey to ourselve");
 
         if( rand() < (RAND_MAX/2) ) {
-            dmsToSend.push_back(&dmOldFormat);
-            dmsToSend.push_back(&dmNewFormat);
+            dmsToSend.push_back(&dmRcpt);
+            dmsToSend.push_back(&dmSelf);
         } else {
-            dmsToSend.push_back(&dmNewFormat);
-            dmsToSend.push_back(&dmOldFormat);
+            dmsToSend.push_back(&dmSelf);
+            dmsToSend.push_back(&dmRcpt);
         }
     } else {
-        dmsToSend.push_back(&dmOldFormat);
+        dmsToSend.push_back(&dmRcpt);
     }
 
     Value ret;
 
     BOOST_FOREACH(entry *dm, dmsToSend) {
         entry v;
-        if( !createSignedUserpost(v, strFrom, k, "",
-                                  NULL, NULL, dm,
+        if( !createSignedUserpost(v, strFrom, k,
+                                  USERPOST_FLAG_DM,
+                                  "", dm, NULL,
                                   std::string(""), 0) )
             throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
 
@@ -1945,6 +2442,8 @@ Value newdirectmsg(const Array& params, bool fHelp)
             // do not send a copy to self, so just store it locally.
             StoredDirectMsg stoDM;
             stoDM.m_fromMe  = true;
+            stoDM.m_from    = strFrom;
+            stoDM.m_k       = k;
             stoDM.m_text    = strMsg;
             stoDM.m_utcTime = v["userpost"]["time"].integer();
 
@@ -1953,7 +2452,9 @@ Value newdirectmsg(const Array& params, bool fHelp)
         }
 
         torrent_handle h = startTorrentUser(strFrom, true);
-        h.add_piece(k++,buf.data(),buf.size());
+        if( h.is_valid() ) {
+            h.add_piece(k++,buf.data(),buf.size());
+        }
 
         hexcapePost(v);
         ret = entryToJson(v);
@@ -1963,9 +2464,9 @@ Value newdirectmsg(const Array& params, bool fHelp)
 
 Value newrtmsg(const Array& params, bool fHelp)
 {
-    if (fHelp || (params.size() != 3))
+    if (fHelp || params.size() < 3 || params.size() > 4)
         throw runtime_error(
-            "newrtmsg <username> <k> <rt_v_object>\n"
+            "newrtmsg <username> <k> <rt_v_object> [comment]\n"
             "Post a new RT to swarm");
 
     EnsureWalletIsUnlocked();
@@ -1977,6 +2478,7 @@ Value newrtmsg(const Array& params, bool fHelp)
     unHexcapePost(vrt);
     entry const *rt    = vrt.find_key("userpost");
     entry const *sig_rt= vrt.find_key("sig_userpost");
+    string strComment  = params.size() > 3 ? params[3].get_str() : "";
 
     entry v;
     // [MF] Warning: findLastPublicPostLocalUser requires that we follow ourselves
@@ -1984,8 +2486,9 @@ Value newrtmsg(const Array& params, bool fHelp)
     if( lastk >= 0 )
         v["userpost"]["lastk"] = lastk;
 
-    if( !createSignedUserpost(v, strUsername, k, "",
-                              rt, sig_rt, NULL,
+    if( !createSignedUserpost(v, strUsername, k,
+                              USERPOST_FLAG_RT,
+                              strComment, rt, sig_rt,
                               std::string(""), 0) )
         throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
 
@@ -2019,6 +2522,75 @@ Value newrtmsg(const Array& params, bool fHelp)
         dhtPutData(rt_user, string("rts")+rt_k, true,
                          v, strUsername, GetAdjustedTime(), 0);
     }
+    //look for hashtags and mentions in comment
+    dispatchHM(strComment, strUsername, v);
+
+    hexcapePost(v);
+    return entryToJson(v);
+}
+
+
+Value newfavmsg(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 3 || params.size() > 5)
+        throw runtime_error(
+            "newfavmsg <username> <k> <fav_v_object> [private=false] [comment=''] \n"
+            "Add a post to swarm as a favorite");
+
+    EnsureWalletIsUnlocked();
+
+    string strUsername = params[0].get_str();
+    int k              = params[1].get_int();
+    string strK        = boost::lexical_cast<std::string>(k);
+    string strComment  = (params.size() > 4) ? params[4].get_str() : "";
+    entry  vfav        = jsonToEntry(params[2].get_obj());
+    bool isPriv        = (params.size() > 3) ? params[3].get_bool() : false;
+    unHexcapePost(vfav);
+    entry const *fav    = vfav.find_key("userpost");
+    entry const *sig_fav= vfav.find_key("sig_userpost");
+
+    entry v;
+
+    if (isPriv)
+    {
+        //comments for private favs should be private too...
+        vfav["comment"] = strComment;
+        std::vector<char> payloadbuf;
+        bencode(std::back_inserter(payloadbuf), vfav);
+        std::string strMsgData = std::string(payloadbuf.data(),payloadbuf.size());
+
+        entry pfav;
+        if( !createDirectMessage(pfav, strUsername, strMsgData) )
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "error encrypting to pubkey of destination user");
+
+        if( !createSignedUserpost(v, strUsername, k,
+                                  USERPOST_FLAG_P_FAV,
+                                  "", &pfav, NULL,
+                                  std::string(""), 0) )
+            throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
+    }
+    else if( !createSignedUserpost(v, strUsername, k,
+                                   USERPOST_FLAG_FAV,
+                                   strComment, fav, sig_fav,
+                                   std::string(""), 0) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
+
+    vector<char> buf;
+    bencode(std::back_inserter(buf), v);
+
+    std::string errmsg;
+    if( !acceptSignedPost(buf.data(),buf.size(),strUsername,k,errmsg,NULL) )
+        throw JSONRPCError(RPC_INVALID_PARAMS,errmsg);
+
+    torrent_handle h = startTorrentUser(strUsername, true);
+    if( h.is_valid() ) {
+        // if member of torrent post it directly
+        h.add_piece(k,buf.data(),buf.size());
+    }
+    //look for mentions and hashtags in comment if it isn't private...
+    if (!isPriv)
+        dispatchHM(strComment, strUsername, v);
 
     hexcapePost(v);
     return entryToJson(v);
@@ -2026,15 +2598,17 @@ Value newrtmsg(const Array& params, bool fHelp)
 
 Value getposts(const Array& params, bool fHelp)
 {
-    if (fHelp || params.size() < 2 || params.size() > 3)
+    if (fHelp || params.size() < 2 || params.size() > 4)
         throw runtime_error(
-            "getposts <count> '[{\"username\":username,\"max_id\":max_id,\"since_id\":since_id},...]' [flags]\n"
+            "getposts <count> '[{\"username\":username,\"max_id\":max_id,\"since_id\":since_id},...]' [allowed_flags=~2] [required_flags=0]\n"
             "get posts from users\n"
-            "max_id and since_id may be omited");
+            "max_id and since_id may be omited\n"
+            "(optional) allowed/required flags are bitwise fields (1=RT,2=DM,4=FAV,12=PFAV)");
 
     int count          = params[0].get_int();
     Array users        = params[1].get_array();
-    int flags          = (params.size() > 2) ? params[2].get_int() : ~USERPOST_FLAG_DM;
+    int allowed_flags  = (params.size() > 2) ? params[2].get_int() : USERPOST_FLAG_HOME;
+    int required_flags = (params.size() > 3) ? params[3].get_int() : 0;
 
     std::multimap<int64,entry> postsByTime;
 
@@ -2053,13 +2627,14 @@ Value getposts(const Array& params, bool fHelp)
         torrent_handle h = getTorrentUser(strUsername);
         if( h.is_valid() ){
             std::vector<std::string> pieces;
-            h.get_pieces(pieces, count, max_id, since_id, flags);
+            h.get_pieces(pieces, count, max_id, since_id, allowed_flags, required_flags);
 
             BOOST_FOREACH(string const& piece, pieces) {
                 lazy_entry v;
                 int pos;
                 libtorrent::error_code ec;
-                if (lazy_bdecode(piece.data(), piece.data()+piece.size(), v, ec, &pos) == 0) {
+                if (lazy_bdecode(piece.data(), piece.data()+piece.size(), v, ec, &pos) == 0 &&
+                    v.type() == lazy_entry::dict_t) {
                     lazy_entry const* post = v.dict_find_dict("userpost");
                     int64 time = post->dict_find_int_value("time",-1);
                     
@@ -2089,7 +2664,7 @@ Value getposts(const Array& params, bool fHelp)
         if( m_receivedSpamMsgStr.length() && GetAdjustedTime() > m_lastSpamTime + (8*3600) ) {
             m_lastSpamTime = GetAdjustedTime();
 
-            entry v = formatSpamPost(m_receivedSpamMsgStr, m_receivedSpamUserStr);
+            entry v = formatSpamPost(m_receivedSpamMsgStr, m_receivedSpamUserStr, 0, m_receivedSpamHeight);
             ret.insert(ret.begin(),entryToJson(v));
 
             m_receivedSpamMsgStr = "";
@@ -2139,6 +2714,8 @@ Value getdirectmsgs(const Array& params, bool fHelp)
                 dmObj.push_back(Pair("time",dmsFromToUser.at(i).m_utcTime));
                 dmObj.push_back(Pair("text",dmsFromToUser.at(i).m_text));
                 dmObj.push_back(Pair("fromMe",dmsFromToUser.at(i).m_fromMe));
+                dmObj.push_back(Pair("from",dmsFromToUser.at(i).m_from));
+                dmObj.push_back(Pair("k",dmsFromToUser.at(i).m_k));
                 userMsgs.push_back(dmObj);
             }
             if( userMsgs.size() ) {
@@ -2205,15 +2782,125 @@ Value getmentions(const Array& params, bool fHelp)
     return ret;
 }
 
+Value getfavs(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 2 || params.size() > 3 )
+        throw runtime_error(
+            "getfavs <localuser> <count> '{\"max_id\":max_id,\"since_id\":since_id}'\n"
+            "Get favorite posts (private favorites are included) of localuser\n"
+            "max_id and since_id may be omited. up to <count> posts are returned.");
+
+    string strUsername  = params[0].get_str();
+    int cnt             = params[1].get_int();
+    int max_id = std::numeric_limits<int>::max();
+    int since_id = -1;
+
+    if( params.size() > 2 ) {
+        Object optParms    = params[2].get_obj();
+        for (Object::const_iterator i = optParms.begin(); i != optParms.end(); ++i) {
+            if( i->name_ == "max_id" ) max_id = i->value_.get_int();
+            if( i->name_ == "since_id" ) since_id = i->value_.get_int();
+        }
+    }
+
+    multimap<int64,entry> postsByTime;
+
+    torrent_handle h = startTorrentUser(strUsername, true);
+    if( h.is_valid() ) {
+        std::vector<std::string> pieces;
+        h.get_pieces(pieces, cnt, max_id, since_id, USERPOST_FLAG_P_FAV, USERPOST_FLAG_FAV);
+
+        BOOST_FOREACH(string const& piece, pieces) {
+            lazy_entry v;
+            int pos;
+            libtorrent::error_code ec;
+            if (lazy_bdecode(piece.data(), piece.data()+piece.size(), v, ec, &pos) == 0 &&
+                v.type() == lazy_entry::dict_t) {
+                lazy_entry const* post = v.dict_find_dict("userpost");
+                if (!post || post->type() != lazy_entry::dict_t)
+                    continue;
+                int64 time = post->dict_find_int_value("time",-1);
+
+                if(time == -1 || time > GetAdjustedTime() + MAX_TIME_IN_FUTURE ) {
+                    printf("getposts: ignoring far-future message by '%s'\n", strUsername.c_str());
+                    continue;
+                }
+
+                lazy_entry const* fav = post->dict_find_dict("fav");
+                lazy_entry const* pfav = post->dict_find_dict("pfav");
+                if (fav && fav->type() == lazy_entry::dict_t)
+                {
+                    entry vEntry;
+                    vEntry = v;
+                    vEntry["isPrivate"] = false;
+                    hexcapePost(vEntry);
+                    postsByTime.insert( pair<int64,entry>(time, vEntry) );
+                }
+                else if (pfav && pfav->type() == lazy_entry::dict_t)
+                {
+                    ecies_secure_t sec;
+                    sec.key = pfav->dict_find_string_value("key");
+                    sec.mac = pfav->dict_find_string_value("mac");
+                    sec.orig = pfav->dict_find_int_value("orig");
+                    sec.body = pfav->dict_find_string_value("body");
+
+                    CKey key;
+                    CKeyID keyID;
+                    if (pwalletMain->GetKeyIdFromUsername(strUsername, keyID) &&
+                        pwalletMain->GetKey( keyID, key) ) {
+                        /* success: key obtained from wallet */
+
+                        string textOut;
+                        if (key.Decrypt(sec, textOut))
+                        {
+                            lazy_entry dfav;
+                            if (lazy_bdecode(textOut.data(), textOut.data()+textOut.size(), dfav, ec, &pos) == 0
+                                    && dfav.type() == lazy_entry::dict_t) {
+                                        entry vEntry, upst;
+
+                                        upst["fav"] = *(dfav.dict_find_dict("userpost"));
+                                        upst["sig_fav"] = dfav.dict_find_string_value("sig_userpost");
+                                        upst["n"] = post->dict_find_string_value("n");
+                                        upst["k"] = post->dict_find_int_value("k");
+                                        upst["msg"] = dfav.dict_find_string_value("comment");
+                                        upst["time"] = post->dict_find_int_value("time");
+                                        upst["height"] = post->dict_find_int_value("height");
+
+                                        vEntry["isPrivate"] = true;
+                                        vEntry["userpost"] = upst;
+
+                                        hexcapePost(vEntry);
+                                        postsByTime.insert( pair<int64,entry>(time, vEntry) );
+
+                                }
+                        }
+                    } else
+                      printf("getfavs: no key for user '%s'\n", strUsername.c_str());
+                }
+            }
+        }
+    }
+
+    Array ret;
+    std::multimap<int64,entry>::reverse_iterator rit;
+    for (rit=postsByTime.rbegin(); rit!=postsByTime.rend() && (int)ret.size() < cnt; ++rit) {
+        ret.push_back( entryToJson(rit->second) );
+    }
+
+    return ret;
+}
+
 Value setspammsg(const Array& params, bool fHelp)
 {
-    if (fHelp || (params.size() != 2))
+    if (fHelp || params.size() < 2 || params.size() > 3)
         throw runtime_error(
-            "setspammsg <username> <msg>\n"
-            "Set spam message attached to generated blocks");
+            "setspammsg <username> <msg> [add|remove|replace]\n"
+            "Set spam message attached to generated blocks\n"
+            "replace is default operation.");
 
     string strUsername = params[0].get_str();
     string strMsg      = params[1].get_str();
+    string strOp       = params.size() == 3 ? params[2].get_str() : "replace";
 
     int spamMsgUtf8Size = utf8::num_characters(strMsg.begin(), strMsg.end());
     if (spamMsgUtf8Size < 0)
@@ -2223,10 +2910,30 @@ Value setspammsg(const Array& params, bool fHelp)
     if (spamMsgUtf8Size > MAX_SPAM_MSG_SIZE)
         throw JSONRPCError(RPC_INTERNAL_ERROR, "spam message too big");
 
-    strSpamUser    = strUsername;
-    strSpamMessage = strMsg;
+    Array ret;
+    {
+        LOCK(cs_spamMessages);
+        strSpamUser    = strUsername;
+        if (strOp == "add")
+        {
+            spamMessages.push_back(strMsg);
+            spamMessages.unique();
+        }
+        else if (strOp == "remove")
+            spamMessages.remove(strMsg);
+        else if (strOp == "replace")
+        {
+            spamMessages.clear();
+            spamMessages.push_back(strMsg);
+        }
+        else
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown operation");
 
-    return Value();
+        BOOST_FOREACH(string msg, spamMessages)
+            ret.push_back(msg);
+    }
+
+    return ret;
 }
 
 Value getspammsg(const Array& params, bool fHelp)
@@ -2238,9 +2945,49 @@ Value getspammsg(const Array& params, bool fHelp)
 
     Array ret;
     ret.push_back(strSpamUser);
-    ret.push_back(strSpamMessage);
+
+    {
+        LOCK(cs_spamMessages);
+        BOOST_FOREACH(string msg, spamMessages)
+            ret.push_back(msg);
+    }
+    //if spamMessages is empty, use default message...
+    if (ret.size() == 1)
+        ret.push_back(strSpamMessage);
 
     return ret;
+}
+
+Value setpreferredspamlang(const Array& params, bool fHelp)
+{
+    if (fHelp || (params.size() != 1))
+        throw runtime_error(
+            "setpreferredspamlang <langcode>\n"
+            "Set preferred spam language (or 'none')");
+
+    string strLangCode = params[0].get_str();
+
+    if (strLangCode == "none") {
+        m_preferredSpamLang = "[]";
+    } else {
+        if( strLangCode.find("[") == string::npos ) {
+            m_preferredSpamLang = "[" + strLangCode + "]";
+        } else {
+            m_preferredSpamLang = strLangCode;
+        }
+    }
+
+    return Value();
+}
+
+Value getpreferredspamlang(const Array& params, bool fHelp)
+{
+    if (fHelp || (params.size() != 0))
+        throw runtime_error(
+            "getpreferredspamlang\n"
+            "get preferred spam language");
+
+    return Value(m_preferredSpamLang);
 }
 
 Value follow(const Array& params, bool fHelp)
@@ -2310,14 +3057,22 @@ Value getfollowing(const Array& params, bool fHelp)
 
 Value getlasthave(const Array& params, bool fHelp)
 {
-    if (fHelp || (params.size() != 1))
+    if (fHelp || params.size() < 1 || params.size() > 2)
         throw runtime_error(
-            "getlasthave <username>\n"
-            "get last 'have' (higher post number) of each user user we follow");
-
-    string localUser = params[0].get_str();
+            "getlasthave <username> | <groupname> [user1,user2...]\n"
+            "get last 'have' (higher post number) of each user local user follows.\n"
+            "if a groupname with an array is given, only those users' last 'have' values will be returned.");
 
     std::set<std::string> following;
+
+    string localUser = params[0].get_str();
+    if (params.size() > 1)
+    {
+        Array userlist = params[1].get_array();
+        for (unsigned int i = 0; i < userlist.size(); i++)
+            following.insert(userlist[i].get_str());
+    }
+    else
     {
         LOCK(cs_twister);
         if( m_users.count(localUser) )
@@ -2707,27 +3462,39 @@ lazy_entry const* TextSearch::matchRawMessage(string const &rawMessage, lazy_ent
 
     int pos;
     libtorrent::error_code ec;
-    if (lazy_bdecode(rawMessage.data(), rawMessage.data()+rawMessage.size(), v, ec, &pos) == 0) {
+    if (lazy_bdecode(rawMessage.data(), rawMessage.data()+rawMessage.size(), v, ec, &pos) == 0 && 
+        v.type() == lazy_entry::dict_t) {
         lazy_entry const* vv = v.dict_find_dict("v");
         lazy_entry const* post = vv ? vv->dict_find_dict("userpost") : v.dict_find_dict("userpost");
         if( post ) {
             lazy_entry const* rt = post->dict_find_dict("rt");
             lazy_entry const* p = rt ? rt : post;
+            string comment;
+            if (rt)
+                comment = post->dict_find_string_value("msg");
 
             if( username.length() ) {
                 string user = p->dict_find_string_value("n");
-                if( user != username ) {
+                string rtuser;
+                if (rt)
+                    rtuser = post->dict_find_string_value("n");
+                if( user != username && (!comment.size() || rtuser != username)) {
                     return 0;
                 }
             }
 
             int64_t time = p->dict_find_int_value("time");
-            if( !matchTime(time) ) {
+            int64_t rttime = 0;
+            if (comment.size())
+                rttime = post->dict_find_int_value("time");
+            if( !matchTime(time) && (!rttime || !matchTime(rttime)) ) {
                 return 0;
             }
 
             string msg = p->dict_find_string_value("msg");
-            return matchText( msg ) ? p : 0;
+            if (matchText(msg) || matchText(comment))
+                //for RTable results, it returns signed post instead of userpost
+                return vv ? vv : &v;
         }
     }
     return 0;
@@ -2737,9 +3504,9 @@ Value search(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() < 3 || params.size() > 4)
         throw runtime_error(
-            "search <scope> <text> <count> ['{\"username\":username,\"mode\":\"exact\"|\"all\"|\"any\",\"case\":\"sensitive\"|\"insensitive\",\"agemin\":agemin,\"agemax\":agemin}']\n"
+            "search <scope> <text> <count> ['{\"username\":username,\"mode\":\"exact\"|\"all\"|\"any\",\"case\":\"sensitive\"|\"insensitive\",\"agemin\":agemin,\"agemax\":agemax}']\n"
             "search text in available data\n"
-            "<scope> is data area: messages, directmsgs, profiles, users, hashtags\n"
+            "<scope> is data area: messages, directmsgs, profiles, users, hashtags, favorites\n"
             "<text> is a phrase to search\n"
             "up to <count> entries are returned\n"
             "<username> in messages scope is optional and allows to search in username's messages only\n"
@@ -2787,20 +3554,24 @@ Value search(const Array& params, bool fHelp)
 
             BOOST_FOREACH(const PAIRTYPE(std::string,torrent_handle)& item, users) {
                 std::vector<std::string> pieces;
-                item.second.get_pieces(pieces, std::numeric_limits<int>::max(), std::numeric_limits<int>::max(), -1, ~USERPOST_FLAG_DM);
+                item.second.get_pieces(pieces, std::numeric_limits<int>::max(), std::numeric_limits<int>::max(), -1, USERPOST_FLAG_HOME, 0);
 
                 BOOST_FOREACH(string const& piece, pieces) {
                     lazy_entry const* p = searcher.matchRawMessage(piece, v);
                     if( p ) {
-                        string n = p->dict_find_string_value("n");
-                        int k = p->dict_find_int_value("k");
-                        int64 time = p->dict_find_int_value("time",-1);
+                        const lazy_entry *up = p->dict_find_dict("userpost");
+                        if (up)
+                        {
+                            string n = up->dict_find_string_value("n");
+                            int k = up->dict_find_int_value("k");
+                            int64 time = up->dict_find_int_value("time",-1);
 
-                        entry vEntry;
-                        vEntry = *p;
-                        hexcapePost(vEntry);
+                            entry vEntry;
+                            vEntry = *p;
+                            hexcapePost(vEntry);
 
-                        posts[pair<std::string,int>(n,k)] = pair<int64,entry>(time,vEntry);
+                            posts[pair<std::string,int>(n,k)] = pair<int64,entry>(time,vEntry);
+                        }
                     }
                 }
             }
@@ -2823,17 +3594,21 @@ Value search(const Array& params, bool fHelp)
                             string str_p = key_p->string();
                             lazy_entry const* p = searcher.matchRawMessage(str_p, v);
                             if( p ) {
-                                string n = p->dict_find_string_value("n");
-                                int k = p->dict_find_int_value("k");
-                                pair<std::string,int> post_id(n,k);
-                                if( posts.count(post_id) == 0 ) {
-                                    int64 time = p->dict_find_int_value("time",-1);
+                                const lazy_entry *up = p->dict_find_dict("userpost");
+                                if (up)
+                                {
+                                    string n = up->dict_find_string_value("n");
+                                    int k = up->dict_find_int_value("k");
+                                    pair<std::string,int> post_id(n,k);
+                                    if( posts.count(post_id) == 0 ) {
+                                        int64 time = up->dict_find_int_value("time",-1);
 
-                                    entry vEntry;
-                                    vEntry = *p;
-                                    hexcapePost(vEntry);
+                                        entry vEntry;
+                                        vEntry = *p;
+                                        hexcapePost(vEntry);
 
-                                    posts[post_id] = pair<int64,entry>(time,vEntry);
+                                        posts[post_id] = pair<int64,entry>(time,vEntry);
+                                    }
                                 }
                             }
                         }
@@ -2873,6 +3648,8 @@ Value search(const Array& params, bool fHelp)
                                 vEntry["text"] = item.m_text;
                                 vEntry["time"] = time;
                                 vEntry["fromMe"] = item.m_fromMe;
+                                vEntry["from"] = item.m_from;
+                                vEntry["k"] = item.m_k;
                                 hexcapePost(vEntry);
                                 postsByTime.insert( pair<int64,entry>(time, vEntry) );
                             }
@@ -2905,7 +3682,10 @@ Value search(const Array& params, bool fHelp)
                     lazy_entry p;
                     int pos;
                     libtorrent::error_code err;
-                    int ret = lazy_bdecode(str_p.data(), str_p.data() + str_p.size(), p, err, &pos);
+                    if( lazy_bdecode(str_p.data(), str_p.data() + str_p.size(), p, err, &pos) != 0 ||
+                        p.type() != lazy_entry::dict_t) {
+                        continue;
+                    }
 
                     lazy_entry const* target = p.dict_find_dict("target");
                     if( target ) {
@@ -2946,7 +3726,7 @@ Value search(const Array& params, bool fHelp)
         boost::algorithm::to_lower(keyword);
 
         string allowed = "abcdefghijklmnopqrstuvwxyz0123456789_";
-        for( int i = 0; i < allowed.size(); ++i ) {
+        for( int i = 0; i < (int)allowed.size(); ++i ) {
             set<string> usernames;
             string prefix(1, allowed[i]);
             pblocktree->GetNamesFromPartial(prefix, usernames, std::numeric_limits<int>::max());
@@ -2988,7 +3768,59 @@ Value search(const Array& params, bool fHelp)
             ret.push_back( entryToJson(it->second) );
         }
 
-    } else {
+    }
+    else if (scope == "favorites")
+    {
+        std::multimap<int64_t,Value> postsByTime;
+
+        TextSearch searcher(keyword, options);
+
+        set<string> users;
+        if (username.size())
+            users.insert(username);
+        else
+        {
+            for (map<string,torrent_handle>::const_iterator it = m_userTorrent.begin(); it != m_userTorrent.end(); ++it)
+                users.insert(it->first);
+        }
+
+        BOOST_FOREACH(string user, users)
+        {
+            Array params;
+            params.push_back(user);
+            params.push_back(INT_MAX);
+            Array favs = getfavs(params, false).get_array();
+            for (int i = 0; i < (int)favs.size(); i++)
+            {
+                entry favp = jsonToEntry(favs[i]);
+                entry *favu = favp.find_key("userpost");
+                if (favu && favu->type() == entry::dictionary_t)
+                {
+                    entry* commEnt = favu->find_key("msg");
+                    string comnt;
+                    if (commEnt && commEnt->type() == entry::string_t)
+                        comnt = commEnt->string();
+
+                    entry *favEnt = favu->find_key("fav");
+                    string msg;
+                    if (favEnt)
+                        msg = favEnt->find_key("msg")->string();
+
+                    if( searcher.matchText(msg) || searcher.matchText(comnt) )
+                    {
+                        int64_t ft = favu->find_key("time")->integer();
+                        if(searcher.matchTime(ft))
+                            postsByTime.insert(pair<int64_t,Value>(ft, favs[i]));
+                    }
+                }
+            }
+        }
+
+        std::multimap<int64_t,Value>::reverse_iterator rit;
+        for (rit = postsByTime.rbegin(); rit != postsByTime.rend() && (int)ret.size() < count; ++rit)
+           ret.push_back(rit->second);
+    }
+    else {
         throw runtime_error("Unknown <scope> value");
     }
 
@@ -3001,6 +3833,8 @@ Object getLibtorrentSessionStatus()
     boost::shared_ptr<session> ses(m_ses);
     if( ses ) {
         session_status stats = ses->status();
+        
+        obj.push_back( Pair("ext_addr_net2", stats.external_addr_v4) );
 
         obj.push_back( Pair("dht_torrents", stats.dht_torrents) );
         obj.push_back( Pair("num_peers", stats.num_peers) );
@@ -3028,3 +3862,562 @@ Object getLibtorrentSessionStatus()
     // @TODO: Is there a way to get some statistics for dhtProxy?
     return obj;
 }
+
+Value creategroup(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2)
+        throw runtime_error(
+            "creategroup <description> [<groupprivkey>]\n"
+            "Create (if <groupprivkey> is omited) a new key pair for group chat and add it to wallet\n"
+            "Or import the given <groupprivkey> into wallet\n"
+            "Hint: use newgroupinvite to invite yourself\n"
+            "Returns the group alias");
+
+    string strDescription = params[0].get_str();
+    string privKey;
+
+    if (params.size() == 2)
+        privKey = params[1].get_str();
+    else
+    {
+        RandAddSeedPerfmon();
+        CKey secret;
+        secret.MakeNewKey(true);
+        privKey = CBitcoinSecret(secret).ToString();
+    }
+
+    string noMember;
+    registerNewGroup(privKey, strDescription, noMember, noMember, GetTime(), -1);
+
+    return getGroupAliasByKey(privKey);
+}
+
+Value listgroups(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() > 2 )
+        throw runtime_error(
+            "listgroups [username] [list_only_ignored=false]\n"
+            "get list of group chats\n"
+            "if username is given, it will return list of user's groups.");
+
+    string strUsername = (params.size() > 0 ? params[0].get_str() : "");
+    bool onlyIgnored = (params.size() > 1 ? params[1].get_bool() : false);
+
+    Array ret;
+
+    if (strUsername.size() && !m_users.count(strUsername))
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown user");
+
+    if (onlyIgnored)
+    {
+        LOCK(cs_twister);
+        BOOST_FOREACH(string const &strGroup, m_users[strUsername].m_ignoreGroups)
+            ret.push_back(strGroup);
+    }
+    else
+    {
+        LOCK(cs_twister);
+        map<string,GroupChat>::const_iterator i;
+        for (i = m_groups.begin(); i != m_groups.end(); ++i) {
+            if (strUsername.size() && !i->second.m_members.count(strUsername))
+                continue;
+            ret.push_back(i->first);
+        }
+    }
+
+    return ret;
+}
+
+Value getgroupinfo(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "getgroupinfo <groupalias>\n"
+            "get group description and members");
+
+    string strGroupAlias = params[0].get_str();
+
+    Object ret;
+
+    LOCK(cs_twister);
+    if (!m_groups.count(strGroupAlias))
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown group alias");
+
+    ret.push_back(Pair("alias",strGroupAlias));
+    ret.push_back(Pair("description",m_groups.at(strGroupAlias).m_description));
+
+    Array membersList;
+    BOOST_FOREACH( std::string const &n, m_groups.at(strGroupAlias).m_members) {
+        membersList.push_back(n);
+    }
+    ret.push_back(Pair("members",membersList));
+
+    return ret;
+}
+
+static void signAndAddDM(const std::string &strFrom, int k, const entry *dm)
+{
+    entry v;
+    if( !createSignedUserpost(v, strFrom, k,
+                              USERPOST_FLAG_DM,
+                              "", dm, NULL,
+                              std::string(""), 0) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR,"error signing post with private key of user");
+
+    std::vector<char> buf;
+    bencode(std::back_inserter(buf), v);
+
+    std::string errmsg;
+    if( !acceptSignedPost(buf.data(),buf.size(),strFrom,k,errmsg,NULL) )
+        throw JSONRPCError(RPC_INVALID_PARAMS,errmsg);
+
+    torrent_handle h = startTorrentUser(strFrom, true);
+    if( h.is_valid() ) {
+        h.add_piece(k++,buf.data(),buf.size());
+    }
+}
+
+Value newgroupinvite(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 4 )
+        throw runtime_error(
+            "newgroupinvite <username> <k> <groupalias> '[<newmember>,...]'\n"
+            "Invite some new members for a group chat.\n"
+            "note: k is increased by at least 2, check getlasthave");
+
+    EnsureWalletIsUnlocked();
+
+    string strFrom        = params[0].get_str();
+    int k                 = params[1].get_int();
+    string strGroupAlias  = params[2].get_str();
+    Array newmembers      = params[3].get_array();
+
+    std::set<std::string> membersList;
+    {
+        LOCK(cs_twister);
+        if (!m_groups.count(strGroupAlias))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown group alias");
+        membersList = m_groups.at(strGroupAlias).m_members;
+    }
+
+    /* create group_invite DM and send it to each new member */
+    for( unsigned int u = 0; u < newmembers.size(); u++ ) {
+        string strMember = newmembers[u].get_str();
+        membersList.insert(strMember);
+        entry groupInvite;
+        {
+            LOCK(cs_twister);
+            groupInvite["desc"] = m_groups.at(strGroupAlias).m_description;
+            groupInvite["key"]  = m_groups.at(strGroupAlias).m_privKey;
+            if( m_users.count(strMember) )
+                m_users[strMember].m_ignoreGroups.erase(strGroupAlias);
+        }
+        entry payloadMsg;
+        payloadMsg["group_invite"] = groupInvite;
+        std::vector<char> payloadbuf;
+        bencode(std::back_inserter(payloadbuf), payloadMsg);
+        std::string strMsgData = std::string(payloadbuf.data(),payloadbuf.size());
+
+        entry dmInvite;
+        if( !createDirectMessage(dmInvite, strMember, strMsgData) )
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "error encrypting to pubkey of destination user");
+        signAndAddDM(strFrom, k++, &dmInvite);
+    }
+
+    /* create group_members DM and send it to group */
+    while( !membersList.empty() ) {
+        entry groupMembers;
+        int byteCounter = 0;
+        while( !membersList.empty() ) {
+            std::set<std::string>::iterator it = membersList.begin();
+            std::string member=*it;
+            groupMembers.list().push_back(member);
+            membersList.erase(it);
+
+            // estimate bencoded size. split in multiple DMs.
+            byteCounter += member.length() + 2 + member.length()/10;
+            if( byteCounter > 150 )
+                break;
+        }
+        entry payloadMsg;
+        payloadMsg["group_members"] = groupMembers;
+        std::vector<char> payloadbuf;
+        bencode(std::back_inserter(payloadbuf), payloadMsg);
+        std::string strMsgData = std::string(payloadbuf.data(),payloadbuf.size());
+
+        entry dmMembers;
+        if( !createDirectMessage(dmMembers, strGroupAlias, strMsgData) )
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "error encrypting to pubkey of group alias");
+        signAndAddDM(strFrom, k++, &dmMembers);
+    }
+
+    return Value();
+}
+
+Value newgroupdescription(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 4 )
+        throw runtime_error(
+            "newgroupdescription <username> <k> <groupalias> <description>\n"
+            "Change group description by sending a new invite DM to group");
+
+    EnsureWalletIsUnlocked();
+
+    string strFrom        = params[0].get_str();
+    int k                 = params[1].get_int();
+    string strGroupAlias  = params[2].get_str();
+    string strDescription = params[3].get_str();
+
+    entry groupInvite;
+    {
+        LOCK(cs_twister);
+        if (!m_groups.count(strGroupAlias))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown group alias");
+
+        m_groups[strGroupAlias].m_description = strDescription;
+        groupInvite["desc"] = m_groups.at(strGroupAlias).m_description;
+        groupInvite["key"]  = m_groups.at(strGroupAlias).m_privKey;
+    }
+    entry payloadMsg;
+    payloadMsg["group_invite"] = groupInvite;
+    std::vector<char> payloadbuf;
+    bencode(std::back_inserter(payloadbuf), payloadMsg);
+    std::string strMsgData = std::string(payloadbuf.data(),payloadbuf.size());
+
+    entry dmInvite;
+    if( !createDirectMessage(dmInvite, strGroupAlias, strMsgData) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "error encrypting to pubkey of group alias");
+    signAndAddDM(strFrom, k++, &dmInvite);
+
+    return Value();
+}
+
+Value leavegroup(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2 )
+        throw runtime_error(
+            "leavegroup <username> <groupalias>\n"
+            "Stop receiving chats from group");
+
+    string strUser        = params[0].get_str();
+    string strGroupAlias  = params[1].get_str();
+
+    LOCK(cs_twister);
+    if (!m_groups.count(strGroupAlias))
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown group alias");
+
+    if (!m_users.count(strUser))
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "unknown user");
+
+    m_users[strUser].m_directmsg.erase(strGroupAlias);
+    m_users[strUser].m_ignoreGroups.insert(strGroupAlias);
+    m_groups[strGroupAlias].m_members.erase(strUser);
+
+    return Value();
+}
+
+
+Value getpieceavailability(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2 )
+        throw runtime_error(
+            "getpieceavailability <username> <k>\n"
+            "Get piece availability (peer count for this piece)");
+
+    string strUsername    = params[0].get_str();
+    int k                 = params[1].get_int();
+
+    torrent_handle h = getTorrentUser(strUsername);
+    std::vector<int> avail;
+    h.piece_availability(avail);
+
+    return (int)avail.size() > k ? avail.at(k) : 0;
+}
+
+Value getpiecemaxseen(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2 )
+        throw runtime_error(
+            "getpiecemaxseen <username> <k>\n"
+            "Get piece max seen availability (max peer count for this piece)");
+
+    string strUsername    = params[0].get_str();
+    int k                 = params[1].get_int();
+
+    torrent_handle h = getTorrentUser(strUsername);
+    std::vector<int> max_seen;
+    h.piece_max_seen(max_seen);
+
+    return (int)max_seen.size() > k ? max_seen.at(k) : 0;
+}
+
+Value peekpost(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 2 || params.size() > 4 )
+        throw runtime_error(
+            "peekpost <username> <k> [field='*'] [timeout_sec=90]\n"
+            "Peek post from best/faster available source, either\n"
+            "local torrent, DHT or remote torrent (peek extension).\n"
+            "field is a convenience to return specific post field(s)\n"
+            "instead of the whole post (eg. 'url' or 'url,mimetype')");
+
+    boost::shared_ptr<session> ses(m_ses);
+    if( !ses )
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "uninitialized session");
+
+    string strUsername    = params[0].get_str();
+    int k                 = std::max(params[1].get_int(), 0);
+    string strField       = "*";
+    if( params.size() > 2 )
+        strField          = params[2].get_str();
+    time_duration timeToWait = seconds(90);
+    if( params.size() > 3 )
+        timeToWait = seconds(params[3].get_int());
+
+    entry vEntry;
+
+    torrent_handle h = getTorrentUser(strUsername);
+    if( h.is_valid() ) {
+        std::vector<std::string> pieces;
+        int allowed_flags = 0xff;
+        int required_flags = 0;
+        h.get_pieces(pieces, 1, k, k-1, allowed_flags, required_flags);
+
+        lazy_entry v;
+        int pos;
+        libtorrent::error_code ec;
+        if(pieces.size() && 
+           lazy_bdecode(pieces[0].data(), pieces[0].data()+pieces[0].size(), v, ec, &pos) == 0 &&
+           v.type() == lazy_entry::dict_t) {
+            printf("peekpiece: got piece (%s,%d) from local torrent\n",strUsername.c_str(), k);
+            vEntry = v;
+        }
+    } else {
+        /* there is quite some code shared with dhtget, but it is intermigled with
+         * torrent's piece peek. so we accept a little copy-paste for now. */
+        alert_manager am(10, alert::dht_notification);
+        string strResource = "post" + boost::lexical_cast<std::string>(k);
+        bool multi = false;
+        sha1_hash ih = dhtTargetHash(strUsername,strResource,"s");
+
+        vector<CNode*> dhtProxyNodes;
+        if( !DhtProxy::fEnabled ) {
+            dhtgetMapAdd(ih, &am);
+            dhtGetData(strUsername, strResource, multi, true);
+        } else {
+            DhtProxy::dhtgetMapAdd(ih, &am);
+            dhtProxyNodes = DhtProxy::dhtgetStartRequest(strUsername, strResource, multi);
+        }
+
+        h = startTorrentUser(strUsername,true,k);
+
+        // this loop receives alerts from both dht network and torrent peek extension
+        while( h.is_valid() && am.wait_for_alert(timeToWait) ) {
+            std::auto_ptr<alert> a(am.get());
+
+            dht_reply_data_alert const* rd = alert_cast<dht_reply_data_alert>(&(*a));
+            if( rd && rd->m_lst.size() ) {
+                entry dhtEntry = rd->m_lst.front();
+                entry const *pEntry = dhtEntry.find_key("p");
+                if( pEntry && pEntry->type() == entry::dictionary_t ) {
+                    entry const *v = pEntry->find_key("v");
+                    if( v && v->type() == entry::dictionary_t ) {
+                        vEntry = *v;
+                    }
+                }
+                string source = "dht";
+                entry const *pSigEntry = dhtEntry.find_key("sig_p");
+                if(pSigEntry && pSigEntry->type() == entry::string_t &&
+                   pSigEntry->string() == "peek" ) {
+                   source = "peek";
+                }
+                printf("peekpiece: got piece (%s,%d) from %s\n",strUsername.c_str(), k, source.c_str());
+                break;
+            }
+        }
+
+        if( h.is_valid() ) {
+            LOCK(cs_twister);
+            h.pause();
+            h.save_resume_data();
+            num_outstanding_resume_data++;
+        }
+
+        if( !DhtProxy::fEnabled ) {
+            dhtgetMapRemove(ih,&am);
+        } else {
+            DhtProxy::dhtgetMapRemove(ih,&am);
+            DhtProxy::dhtgetStopRequest(dhtProxyNodes, strUsername, strResource, multi);
+        }
+    }
+
+    Value ret;
+    if( vEntry.type() == entry::dictionary_t ) {
+        hexcapePost(vEntry);
+        if( strField == "*" ) {
+            ret = entryToJson(vEntry);
+        } else {
+            entry const *userpost = vEntry.find_key("userpost");
+            if( userpost && userpost->type() == entry::dictionary_t ) {
+                if( strField.find(',') == string::npos ) {
+                    entry const *f = userpost->find_key(strField);
+                    if( f && f->type() == entry::string_t ) {
+                        ret = f->string();
+                    }
+                } else {
+                    vector<string> fieldList;
+                    Array retList;
+                    boost::algorithm::split(fieldList,strField,std::bind1st(std::equal_to<char>(),','),
+                                            boost::algorithm::token_compress_on);
+                    BOOST_FOREACH(string const& field, fieldList) {
+                        entry const *f = userpost->find_key(field);
+                        if( f && f->type() == entry::string_t ) {
+                            retList.push_back(f->string());
+                        } else {
+                            retList.push_back("");
+                        }
+                    }
+                    ret = retList;
+                }
+            }
+        }
+    } else {
+        if(h.is_valid()) {
+            throw JSONRPCError(RPC_TIMEOUT, "timeout or post not found");
+        } else {
+            throw JSONRPCError(RPC_RESOURCE_BUSY_TRY_AGAIN, "resource busy, try again");
+        }
+    }
+
+    return ret;
+}
+
+Value uidtousername(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 1 )
+        throw runtime_error(
+            "uidtousername <uid>\n"
+            "convert uid to username");
+
+    int uid               = params[0].get_int();
+
+    string strUsername;
+    if( !TxNumToUsername(uid, strUsername) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "TxNumToUsername failed");
+
+    return Value(strUsername);
+}
+
+Value usernametouid(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2 )
+        throw runtime_error(
+            "usernametouid <username> [last=true]\n"
+            "convert username to uid");
+
+    string strUsername    = params[0].get_str();
+    bool last             = (params.size() > 1) ? params[1].get_bool() : true;
+
+    int uid;
+    if( !UsernameToTxNum(strUsername, &uid, last) )
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "UsernameToTxNum failed");
+
+    return Value(uid);
+}
+
+Value newshorturl(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 3 || params.size() > 4)
+        throw runtime_error(
+            "newshorturl <username> <k> <url> [mimetype]\n"
+            "Shorten URL, create a post containing it add to swarm.\n"
+            "Returns the shortened twister URI (multiple options may be returned)");
+
+    EnsureWalletIsUnlocked();
+
+    string strUsername = params[0].get_str();
+    int k              = params[1].get_int();
+    string strUrl      = params[2].get_str();
+    string strMimeType;
+    if( params.size() > 3 )
+        strMimeType    = params[3].get_str();
+
+    Array paramsSub;
+    Value res;
+
+    paramsSub.clear();
+    paramsSub.push_back(strUsername);
+    paramsSub.push_back(k);
+    Object fields;
+    fields.push_back(Pair("url",strUrl));
+    if( strMimeType.size() )
+        fields.push_back(Pair("mimetype",strMimeType));
+    paramsSub.push_back(fields);
+    res = newpostcustom(paramsSub,false);
+
+    paramsSub.clear();
+    paramsSub.push_back(strUsername);
+    res = usernametouid(paramsSub, false);
+
+    vector<unsigned char> vch;
+    vch.resize(8);
+    le32enc(&vch[0], res.get_int());
+    le32enc(&vch[4], k);
+    
+    string uid_k_64 = EncodeBase64(&vch[0], vch.size());
+    
+    Array uriOptions;
+    uriOptions.push_back(string("twist:")+uid_k_64);
+    
+    return uriOptions;
+}
+
+Value decodeshorturl(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2 )
+        throw runtime_error(
+            "decodeshorturl <twist:xxx> [timeout_sec=90]\n"
+            "Decodes a shortened URL by twister. May take some time to complete, like dhtget etc.\n"
+            "Returns the original [URL,mimetype] or error if not found, timeout");
+
+    string strTwistURI = params[0].get_str();
+    int timeout = 0;
+    if( params.size() > 1 )
+        timeout = params[1].get_int();
+
+    string protocol("twist:");
+    if (strTwistURI.find(protocol) != 0) {
+        throw JSONRPCError(RPC_PARSE_ERROR, "protocol prefix error");
+    }
+    string uid_k_64 = strTwistURI.substr(protocol.size());
+    if (uid_k_64.length() < 12) {
+        throw JSONRPCError(RPC_PARSE_ERROR, "base64 string too small");
+    }
+    
+    string vch = DecodeBase64(uid_k_64);
+    int uid = le32dec(&vch[0]);
+    int k = le32dec(&vch[4]);
+
+    Array paramsSub;
+    Value res;
+
+    paramsSub.clear();
+    paramsSub.push_back(uid);
+    res = uidtousername(paramsSub, false);
+    
+    string strUsername = res.get_str();
+    
+    paramsSub.clear();
+    paramsSub.push_back(strUsername);
+    paramsSub.push_back(k);
+    paramsSub.push_back("url,mimetype");
+    if(timeout) {
+        paramsSub.push_back(timeout);
+    }
+    return peekpost(paramsSub,false);
+}
+
+

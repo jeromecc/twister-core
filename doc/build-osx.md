@@ -1,6 +1,6 @@
-Mac OS X Build Instructions and Notes
+OS X Build Instructions and Notes
 ====================================
-This guide will show you how to build twisterd for OSX.
+This guide will show you how to build twisterd for OS X.
 
 Notes
 -----
@@ -21,22 +21,22 @@ Xcode 4.3 or later, you'll need to install its command line tools. This can
 be done in `Xcode > Preferences > Downloads > Components` and generally must
 be re-done or updated every time Xcode is updated.
 
-There's an assumption that you already have `git` installed, as well. If
-not, it's the path of least resistance to install [Github for Mac](https://mac.github.com/)
-(OS X 10.7+) or
+There's an assumption that you already have `git` installed, as well. If not,
+it's the path of least resistance to install
+[GitHub Desktop](https://desktop.github.com/) or
 [Git for OS X](https://code.google.com/p/git-osx-installer/). It is also
 available via Homebrew or MacPorts.
 
-You will also need to install [Homebrew](http://mxcl.github.io/homebrew/)
+You will also need to install [Homebrew](http://brew.sh/)
 or [MacPorts](https://www.macports.org/) in order to install library
-dependencies. It's largely a religious decision which to choose, but I tested only with 
+dependencies. It's largely a religious decision which to choose, but I tested only with
 Homebrew.
 
 The installation of the actual dependencies is covered in the Instructions
 sections below.
 
 
-Instructions: HomeBrew
+Instructions: Homebrew
 ----------------------
 
 #### Install dependencies using Homebrew
@@ -56,14 +56,14 @@ Instructions: HomeBrew
         ./autotool.sh
         ./configure --enable-logging --with-openssl=/usr/local/opt/openssl --with-libdb=/usr/local/opt/berkeley-db4
         make
-(If you have multi core CPU, use "make -j N" where N = number of your cores)
+(If you have multi core CPU, use "make -j N" where N = the number of your cores)
 
 3. If things go south, before trying again, make sure you clean it up:
 
 
         make clean
 
-If all went well, you should now have a twisterd executable in the twister-core directory. 
+If all went well, you should now have a twisterd executable in the twister-core directory.
 See the Running instructions below.
 
 Instructions: MacPorts (UNTESTED!!)
@@ -84,7 +84,7 @@ Once installed dependencies, do:
 If things go south, before trying again, make sure you clean it up:
 
     make clean
-    
+
 Running
 -------
 
@@ -99,7 +99,7 @@ commands:
     chmod 600 "/Users/${USER}/.twister/twister.conf"
 
 When next you run it, it will start downloading the blockchain, but it won't
-output anything while it's doing this. This process may take several hours. If you see a lonely 
+output anything while it's doing this. This process may take several hours. If you see a lonely
 `connect: Operation timed out`, don't freak out, it seems to work fine.
 
 Other commands:
@@ -111,12 +111,12 @@ Other commands:
 
 In order to get the HTML interface, you'll have to download it and link it in .twister:
 
-     git clone https://github.com/miguelfreitas/twister-html.git /Users/${USER}/.twister/html
+     git clone https://github.com/miguelfreitas/twister-html.git /Users/${USER}/Library/Application\ Support/twister/html
 
 Once you do that, it will be available at http://localhost:28332/home.html
 
 Troubleshooting
 -------
-1) You get "DHT network down" in WEB interface on /network.html page 
+1) You get "DHT network down" in WEB interface on /network.html page
  - Reboot your Mac
- 
+
